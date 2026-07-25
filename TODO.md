@@ -13,10 +13,10 @@ This file tracks the implementation phases for this project.
 - [x] Add provider-native resume metadata flow for `codex`, `claude`, and `opencode`, with replay fallback.
 - [x] Add self-contained JSON resume handles in addition to path-based resume.
 - [x] Add CLI-level MCP server loading from JSON config files.
+- [x] Replace one-shot provider parsing with richer event-to-trajectory block parsing for all providers.
 
 ## Remaining parity work
 
-- [ ] Replace one-shot provider parsing with richer event-to-trajectory block parsing for all providers.
 - [ ] Add tool-call and thinking block fidelity that matches the Python wrapper more closely.
 - [ ] Add persisted agent config files for MCP attachment and reusable project defaults.
 - [ ] Add portable pricing tables and computed cost fallback when providers omit cost fields.
@@ -32,6 +32,7 @@ This file tracks the implementation phases for this project.
 - [x] Unit tests for on-disk session persistence.
 - [x] Unit tests for env-driven provider order.
 - [x] Unit tests for native resume metadata flow.
+- [x] Unit tests for provider block parsing across codex, claude, and opencode.
 - [ ] Fixture tests for Claude JSON output parsing.
 - [ ] Fixture tests for opencode JSON event parsing.
 - [ ] Integration tests for CLI commands with mocked provider binaries.

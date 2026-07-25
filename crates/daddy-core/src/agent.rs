@@ -262,11 +262,16 @@ impl Session {
             resume,
         })?;
         merge_metadata(&mut self.trajectory.metadata, response.metadata);
+        let output = if response.blocks.is_empty() {
+            vec![ContentBlock::Text {
+                text: response.text.clone(),
+            }]
+        } else {
+            response.blocks.clone()
+        };
         let turn = Turn {
             input: message.to_string(),
-            output: vec![ContentBlock::Text {
-                text: response.text.clone(),
-            }],
+            output,
             usage: response.usage.clone(),
             duration_ms: response.duration_ms,
         };
@@ -595,6 +600,7 @@ mod tests {
                     "echo: {}",
                     request.prompt.lines().last().unwrap_or_default()
                 ),
+                blocks: Vec::new(),
                 raw_output: "raw".to_string(),
                 usage: UsageStats::default(),
                 duration_ms: 0,
@@ -719,6 +725,7 @@ mod tests {
             );
             Ok(ProviderResponse {
                 text: request.message.clone(),
+                blocks: Vec::new(),
                 raw_output: String::new(),
                 usage: UsageStats::default(),
                 duration_ms: 7,

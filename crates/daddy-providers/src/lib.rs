@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use daddy_core::{
-    AuthSignal, MCPServer, ModelTier,
+    AuthSignal, ContentBlock, MCPServer, ModelTier, ToolCall,
     provider::{Provider, ProviderCatalog, ProviderRequest, ProviderResponse},
 };
 use serde_json::Value;
@@ -132,6 +132,7 @@ impl Provider for CodexProvider {
             } else {
                 text.trim().to_string()
             },
+            blocks: parse_codex_blocks(&output.stdout),
             raw_output: String::from_utf8_lossy(&output.stdout).to_string(),
             usage: extract_codex_usage(&output.stdout),
             duration_ms: 0,
@@ -231,6 +232,7 @@ impl Provider for ClaudeProvider {
         }
         Ok(ProviderResponse {
             text,
+            blocks: parse_claude_blocks(&stdout),
             raw_output: stdout,
             usage: extract_claude_usage(&output.stdout),
             duration_ms: extract_claude_duration(&output.stdout),
@@ -319,6 +321,7 @@ impl Provider for OpencodeProvider {
         }
         Ok(ProviderResponse {
             text,
+            blocks: parse_opencode_blocks(&output.stdout),
             raw_output: stdout,
             usage: extract_opencode_usage(&output.stdout),
             duration_ms: 0,
@@ -454,6 +457,425 @@ fn extract_codex_thread_id(stdout: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+// Parse codex JSONL events into ordered content and tool-use blocks.
+fn parse_codex_blocks(stdout: &[u8]) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    let mut tool_positions = BTreeMap::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("event").and_then(Value::as_str));
+        match event_type {
+            Some("item.started") => {
+                handle_codex_item_started(&value, &mut blocks, &mut tool_positions)
+            }
+            Some("item.updated") | Some("item.completed") => {
+                handle_codex_item_completed(&value, &mut blocks, &tool_positions)
+            }
+            Some("turn.failed") | Some("error") => handle_codex_error(&value, &mut blocks),
+            _ => {}
+        }
+    }
+    blocks
+}
+
+// Insert a codex tool block when the stream announces a new item.
+fn handle_codex_item_started(
+    value: &Value,
+    blocks: &mut Vec<ContentBlock>,
+    tool_positions: &mut BTreeMap<String, usize>,
+) {
+    let Some(item) = value.get("item").and_then(Value::as_object) else {
+        return;
+    };
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    let tool_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    match item_type {
+        "command_execution" => {
+            let index = push_tool_block(
+                blocks,
+                ToolCall {
+                    id: tool_id.clone(),
+                    name: "command_execution".to_string(),
+                    arguments: serde_json::json!({ "command": item.get("command").and_then(Value::as_str).unwrap_or_default() }),
+                    output: String::new(),
+                    is_error: false,
+                },
+            );
+            tool_positions.insert(tool_id, index);
+        }
+        "mcp_tool_call" => {
+            let name = match (
+                item.get("server").and_then(Value::as_str),
+                item.get("tool").and_then(Value::as_str),
+            ) {
+                (Some(server), Some(tool)) if !server.is_empty() => format!("{server}.{tool}"),
+                (_, Some(tool)) => tool.to_string(),
+                _ => "mcp_tool_call".to_string(),
+            };
+            let arguments = item
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let index = push_tool_block(
+                blocks,
+                ToolCall {
+                    id: tool_id.clone(),
+                    name,
+                    arguments,
+                    output: String::new(),
+                    is_error: false,
+                },
+            );
+            tool_positions.insert(tool_id, index);
+        }
+        "file_change" => {
+            let index = push_tool_block(
+                blocks,
+                ToolCall {
+                    id: tool_id.clone(),
+                    name: "file_change".to_string(),
+                    arguments: serde_json::json!({
+                        "file": item.get("file").and_then(Value::as_str).unwrap_or_default(),
+                        "action": item.get("action").and_then(Value::as_str).unwrap_or_default()
+                    }),
+                    output: String::new(),
+                    is_error: false,
+                },
+            );
+            tool_positions.insert(tool_id, index);
+        }
+        _ => {}
+    }
+}
+
+// Update a previously inserted codex block from the latest item payload.
+fn handle_codex_item_completed(
+    value: &Value,
+    blocks: &mut Vec<ContentBlock>,
+    tool_positions: &BTreeMap<String, usize>,
+) {
+    let Some(item) = value.get("item").and_then(Value::as_object) else {
+        return;
+    };
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    match item_type {
+        "reasoning" => {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    blocks.push(ContentBlock::Thinking {
+                        text: text.to_string(),
+                    });
+                }
+            }
+        }
+        "agent_message" => {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    blocks.push(ContentBlock::Text {
+                        text: text.to_string(),
+                    });
+                }
+            }
+        }
+        "command_execution" | "mcp_tool_call" | "file_change" => {
+            let tool_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+            let Some(position) = tool_positions.get(tool_id).copied() else {
+                return;
+            };
+            let Some(ContentBlock::ToolUse(tool)) = blocks.get_mut(position) else {
+                return;
+            };
+            match item_type {
+                "command_execution" => {
+                    tool.output = item
+                        .get("output")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    tool.is_error = item.get("exit_code").and_then(Value::as_i64).unwrap_or(0) != 0;
+                }
+                "mcp_tool_call" => {
+                    if let Some(result) = item.get("result") {
+                        tool.output = normalize_mcp_result(result);
+                    }
+                    if let Some(error) = item.get("error") {
+                        tool.output = normalize_error_value(error);
+                        tool.is_error = true;
+                    } else if item.get("status").and_then(Value::as_str) == Some("failed") {
+                        tool.is_error = true;
+                    }
+                }
+                "file_change" => {
+                    tool.output = item
+                        .get("patch")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("content").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string();
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+// Convert codex error events into a visible text block.
+fn handle_codex_error(value: &Value, blocks: &mut Vec<ContentBlock>) {
+    let message = value
+        .get("message")
+        .map(normalize_error_value)
+        .or_else(|| value.get("error").map(normalize_error_value))
+        .unwrap_or_default();
+    if !message.is_empty() {
+        blocks.push(ContentBlock::Text { text: message });
+    }
+}
+
+// Parse Claude JSON output into ordered content and tool-use blocks.
+fn parse_claude_blocks(stdout: &str) -> Vec<ContentBlock> {
+    let Ok(value) = serde_json::from_str::<Value>(stdout) else {
+        return Vec::new();
+    };
+    let mut blocks = Vec::new();
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        for item in content {
+            if let Some(block) = parse_claude_block(item) {
+                blocks.push(block);
+            }
+        }
+        if !blocks.is_empty() {
+            return blocks;
+        }
+    }
+    if let Some(text) = value.get("result").and_then(Value::as_str) {
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: text.to_string(),
+            });
+        }
+    }
+    blocks
+}
+
+// Parse one Claude content block into the shared content model.
+fn parse_claude_block(value: &Value) -> Option<ContentBlock> {
+    let block_type = value.get("type").and_then(Value::as_str)?;
+    match block_type {
+        "text" => Some(ContentBlock::Text {
+            text: value.get("text").and_then(Value::as_str)?.to_string(),
+        }),
+        "thinking" => Some(ContentBlock::Thinking {
+            text: value
+                .get("thinking")
+                .or_else(|| value.get("text"))
+                .and_then(Value::as_str)?
+                .to_string(),
+        }),
+        "tool_use" => Some(ContentBlock::ToolUse(ToolCall {
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: value
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            output: String::new(),
+            is_error: false,
+        })),
+        _ => None,
+    }
+}
+
+// Parse opencode JSONL events into ordered content and tool-use blocks.
+fn parse_opencode_blocks(stdout: &[u8]) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    let mut tool_positions = BTreeMap::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = value
+                    .get("part")
+                    .and_then(Value::as_object)
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    if !text.is_empty() {
+                        blocks.push(ContentBlock::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = extract_opencode_reasoning_text(&value) {
+                    blocks.push(ContentBlock::Thinking { text });
+                }
+            }
+            Some("tool_use") => handle_opencode_tool_use(&value, &mut blocks, &mut tool_positions),
+            Some("error") => {
+                let message = value
+                    .get("error")
+                    .map(normalize_error_value)
+                    .unwrap_or_default();
+                if !message.is_empty() {
+                    blocks.push(ContentBlock::Text { text: message });
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+// Insert or update an opencode tool block based on a tool event.
+fn handle_opencode_tool_use(
+    value: &Value,
+    blocks: &mut Vec<ContentBlock>,
+    tool_positions: &mut BTreeMap<String, usize>,
+) {
+    let Some(part) = value.get("part").and_then(Value::as_object) else {
+        return;
+    };
+    if part.get("type").and_then(Value::as_str) != Some("tool") {
+        return;
+    }
+    let tool_id = part
+        .get("callID")
+        .or_else(|| part.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let state = part
+        .get("state")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let tool_name = part
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let position = if let Some(position) = tool_positions.get(&tool_id).copied() {
+        position
+    } else {
+        let index = push_tool_block(
+            blocks,
+            ToolCall {
+                id: tool_id.clone(),
+                name: tool_name,
+                arguments: state
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                output: String::new(),
+                is_error: false,
+            },
+        );
+        tool_positions.insert(tool_id.clone(), index);
+        index
+    };
+    let Some(ContentBlock::ToolUse(tool)) = blocks.get_mut(position) else {
+        return;
+    };
+    if let Some(output) = state.get("output") {
+        tool.output = normalize_output_value(output);
+    }
+    if let Some(error) = state.get("error") {
+        tool.output = normalize_error_value(error);
+        tool.is_error = true;
+    } else if state.get("status").and_then(Value::as_str) == Some("error") {
+        tool.is_error = true;
+    }
+}
+
+// Extract reasoning text from an opencode reasoning event.
+fn extract_opencode_reasoning_text(value: &Value) -> Option<String> {
+    let part = value.get("part").and_then(Value::as_object)?;
+    if let Some(text) = part.get("text").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let metadata = part.get("metadata").and_then(Value::as_object)?;
+    let has_encrypted = metadata.values().any(|entry| {
+        entry
+            .as_object()
+            .and_then(|entry| entry.get("reasoningEncryptedContent"))
+            .is_some()
+    });
+    if has_encrypted {
+        Some("[encrypted reasoning]".to_string())
+    } else {
+        None
+    }
+}
+
+// Append a tool block and return its index in the block list.
+fn push_tool_block(blocks: &mut Vec<ContentBlock>, tool: ToolCall) -> usize {
+    blocks.push(ContentBlock::ToolUse(tool));
+    blocks.len() - 1
+}
+
+// Convert an MCP tool result value into a readable text payload.
+fn normalize_mcp_result(value: &Value) -> String {
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        let texts: Vec<String> = content
+            .iter()
+            .filter_map(|entry| {
+                if let Some(text) = entry.get("text").and_then(Value::as_str) {
+                    Some(text.to_string())
+                } else {
+                    entry.as_str().map(ToString::to_string)
+                }
+            })
+            .collect();
+        if !texts.is_empty() {
+            return texts.join("\n");
+        }
+    }
+    normalize_output_value(value)
+}
+
+// Convert any output-shaped JSON value into plain text.
+fn normalize_output_value(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        text.to_string()
+    } else {
+        serde_json::to_string(value).unwrap_or_default()
+    }
+}
+
+// Convert any error-shaped JSON value into plain text.
+fn normalize_error_value(value: &Value) -> String {
+    if let Some(text) = value.get("message").and_then(Value::as_str) {
+        text.to_string()
+    } else if let Some(text) = value.as_str() {
+        text.to_string()
+    } else {
+        serde_json::to_string(value).unwrap_or_default()
+    }
 }
 
 // Build an actionable command error from stdout and stderr.
@@ -710,5 +1132,43 @@ mod tests {
             extract_opencode_session_id(input).as_deref(),
             Some("session-123")
         );
+    }
+
+    #[test]
+    // Confirm codex event streams become structured text, thinking, and tool blocks.
+    fn codex_blocks_are_parsed() {
+        let input = br#"{"type":"item.started","item":{"id":"tool-1","type":"command_execution","command":"ls"}}
+{"type":"item.completed","item":{"id":"tool-1","type":"command_execution","output":"file.txt","exit_code":0}}
+{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#;
+        let blocks = parse_codex_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], ContentBlock::ToolUse(_)));
+        assert!(matches!(blocks[1], ContentBlock::Thinking { .. }));
+        assert!(matches!(blocks[2], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    // Confirm Claude JSON content arrays become shared content blocks.
+    fn claude_blocks_are_parsed() {
+        let input = r#"{"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"answer"},{"type":"tool_use","id":"1","name":"Read","input":{"path":"a"}}]}"#;
+        let blocks = parse_claude_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], ContentBlock::Thinking { .. }));
+        assert!(matches!(blocks[1], ContentBlock::Text { .. }));
+        assert!(matches!(blocks[2], ContentBlock::ToolUse(_)));
+    }
+
+    #[test]
+    // Confirm opencode event streams become shared text, thinking, and tool blocks.
+    fn opencode_blocks_are_parsed() {
+        let input = br#"{"type":"reasoning","part":{"text":"plan"}}
+{"type":"tool_use","part":{"type":"tool","callID":"tool-1","tool":"read","state":{"input":{"path":"a"},"output":"hello","status":"completed"}}}
+{"type":"text","part":{"text":"answer"}}"#;
+        let blocks = parse_opencode_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], ContentBlock::Thinking { .. }));
+        assert!(matches!(blocks[1], ContentBlock::ToolUse(_)));
+        assert!(matches!(blocks[2], ContentBlock::Text { .. }));
     }
 }

@@ -1,4 +1,4 @@
-use crate::models::{AuthSignal, MCPServer, ModelTier, ProviderHealth, UsageStats};
+use crate::models::{AuthSignal, ContentBlock, MCPServer, ModelTier, ProviderHealth, UsageStats};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -29,6 +29,7 @@ pub struct ProviderRequest {
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub text: String,
+    pub blocks: Vec<ContentBlock>,
     pub raw_output: String,
     pub usage: UsageStats,
     pub duration_ms: u128,
