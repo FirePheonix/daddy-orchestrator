@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use daddy_core::{Agent, AgentOptions, MCPServer, ModelTier, RunOptions};
-use daddy_orchestrator::{BasicScheduler, CavemanPlanner, JobRequest, Orchestrator};
+use daddy_orchestrator::{
+    BasicScheduler, CavemanPlanner, JobRequest, Orchestrator, StaticContextRouter,
+};
 use daddy_providers::default_catalog;
 use daddy_storage::{inspect_trajectory, load_trajectory};
 use serde::Deserialize;
@@ -180,7 +182,8 @@ async fn main() -> Result<()> {
         }
         Some(CommandKind::Run(args)) => {
             let request = build_job_request(&cli, config_for_cli(&cli)?.as_ref(), &args)?;
-            let orchestrator = Orchestrator::new(CavemanPlanner, BasicScheduler);
+            let orchestrator =
+                Orchestrator::new(CavemanPlanner, BasicScheduler, StaticContextRouter);
             let planned = orchestrator.plan_job(&request)?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&planned)?);
@@ -189,6 +192,7 @@ async fn main() -> Result<()> {
                     &planned,
                     orchestrator.planner_name(),
                     orchestrator.scheduler_name(),
+                    orchestrator.router_name(),
                 );
             }
         }
@@ -431,10 +435,12 @@ fn print_run_summary(
     planned: &daddy_orchestrator::PlannedJob,
     planner_name: &str,
     scheduler_name: &str,
+    router_name: &str,
 ) {
     println!("job {}", planned.graph.job.id);
     println!("planner {planner_name}");
     println!("scheduler {scheduler_name}");
+    println!("router {router_name}");
     println!("goal {}", planned.graph.job.goal);
     println!("tasks {}", planned.graph.tasks.len());
     for stage in &planned.execution.stages {
@@ -458,9 +464,16 @@ fn print_run_summary(
                     ModelTier::Fast => "fast",
                 })
                 .unwrap_or("auto");
+            let context = planned
+                .contexts
+                .iter()
+                .find(|context| context.task_id == task.id)
+                .map(|context| context.relevant_paths.join(","))
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {} [{}] provider={} tier={}",
-                task.title, task.id, provider, model_tier
+                "  {} [{}] provider={} tier={} context={}",
+                task.title, task.id, provider, model_tier, context
             );
         }
     }

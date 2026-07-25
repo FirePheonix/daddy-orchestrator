@@ -116,4 +116,6 @@ pub struct HandoffArtifact {
 pub struct PlannedJob {
     pub graph: TaskGraph,
     pub execution: ExecutionPlan,
+    #[serde(default)]
+    pub contexts: Vec<ContextBundle>,
 }
