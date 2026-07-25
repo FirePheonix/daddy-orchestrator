@@ -6,8 +6,10 @@ use daddy_orchestrator::{
 };
 use daddy_providers::default_catalog;
 use daddy_storage::{inspect_trajectory, load_trajectory};
+use daddy_workspace::GitWorktreeManager;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "daddy", about = "Rust wrapper for coding-agent CLIs")]
@@ -42,7 +44,7 @@ struct Cli {
     #[arg(global = true, long)]
     config: Option<PathBuf>,
 
-    #[arg(global = true)]
+    #[arg()]
     prompt: Vec<String>,
 }
 
@@ -125,6 +127,41 @@ struct RunArgs {
 
     #[arg(long)]
     json: bool,
+
+    #[arg(long)]
+    prepare_worktrees: bool,
+
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RunCommandOutput {
+    planned: daddy_orchestrator::PlannedJob,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prepared_workspaces: Option<daddy_workspace::PreparedWorkspaceSet>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executed_tasks: Option<Vec<ExecutedTask>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExecutedTask {
+    task_id: String,
+    provider: String,
+    workspace: PathBuf,
+    trajectory_path: PathBuf,
+    result: String,
+}
+
+struct TaskAgentSpec {
+    catalog: Arc<dyn daddy_core::ProviderCatalog>,
+    provider: String,
+    model_tier: Option<ModelTier>,
+    cwd: PathBuf,
+    model: Option<String>,
+    reasoning: Option<String>,
+    system_prompt: Option<String>,
+    mcp_servers: Vec<MCPServer>,
 }
 
 #[tokio::main]
@@ -181,15 +218,39 @@ async fn main() -> Result<()> {
             }
         }
         Some(CommandKind::Run(args)) => {
-            let request = build_job_request(&cli, config_for_cli(&cli)?.as_ref(), &args)?;
+            let config = config_for_cli(&cli)?;
+            let request = build_job_request(&cli, config.as_ref(), &args)?;
             let orchestrator =
                 Orchestrator::new(CavemanPlanner, BasicScheduler, StaticContextRouter);
             let planned = orchestrator.plan_job(&request)?;
+            let prepared_workspaces = if args.prepare_worktrees || args.execute {
+                Some(
+                    GitWorktreeManager::default()
+                        .prepare_set(&planned.graph.job, &planned.graph.tasks)?,
+                )
+            } else {
+                None
+            };
+            let executed_tasks = if args.execute {
+                Some(execute_planned_job(
+                    &cli,
+                    config.as_ref(),
+                    &planned,
+                    prepared_workspaces.as_ref(),
+                )?)
+            } else {
+                None
+            };
+            let output = RunCommandOutput {
+                planned,
+                prepared_workspaces,
+                executed_tasks,
+            };
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&planned)?);
+                println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 print_run_summary(
-                    &planned,
+                    &output,
                     orchestrator.planner_name(),
                     orchestrator.scheduler_name(),
                     orchestrator.router_name(),
@@ -432,24 +493,35 @@ fn load_mcp_servers(path: Option<&PathBuf>) -> Result<Vec<MCPServer>> {
 
 // Print a compact orchestration summary for a planned job.
 fn print_run_summary(
-    planned: &daddy_orchestrator::PlannedJob,
+    output: &RunCommandOutput,
     planner_name: &str,
     scheduler_name: &str,
     router_name: &str,
 ) {
-    println!("job {}", planned.graph.job.id);
+    println!("job {}", output.planned.graph.job.id);
     println!("planner {planner_name}");
     println!("scheduler {scheduler_name}");
     println!("router {router_name}");
-    println!("goal {}", planned.graph.job.goal);
-    println!("tasks {}", planned.graph.tasks.len());
-    for stage in &planned.execution.stages {
+    println!("goal {}", output.planned.graph.job.goal);
+    println!("tasks {}", output.planned.graph.tasks.len());
+    if let Some(prepared) = &output.prepared_workspaces {
+        println!("worktree_root {}", prepared.worktree_root.display());
+        println!("prepared_worktrees {}", prepared.worktrees.len());
+    }
+    for stage in &output.planned.execution.stages {
         println!("stage {}", stage.index);
         for task_id in &stage.task_ids {
-            let Some(task) = planned.graph.tasks.iter().find(|task| &task.id == task_id) else {
+            let Some(task) = output
+                .planned
+                .graph
+                .tasks
+                .iter()
+                .find(|task| &task.id == task_id)
+            else {
                 continue;
             };
-            let assignment = planned
+            let assignment = output
+                .planned
                 .execution
                 .assignments
                 .iter()
@@ -464,19 +536,209 @@ fn print_run_summary(
                     ModelTier::Fast => "fast",
                 })
                 .unwrap_or("auto");
-            let context = planned
+            let context = output
+                .planned
                 .contexts
                 .iter()
                 .find(|context| context.task_id == task.id)
                 .map(|context| context.relevant_paths.join(","))
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "-".to_string());
+            let workspace = output
+                .prepared_workspaces
+                .as_ref()
+                .and_then(|prepared| {
+                    prepared
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.task_id == task.id)
+                })
+                .map(|worktree| worktree.path.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {} [{}] provider={} tier={} context={}",
-                task.title, task.id, provider, model_tier, context
+                "  {} [{}] provider={} tier={} context={} workspace={}",
+                task.title, task.id, provider, model_tier, context, workspace
             );
         }
     }
+    if let Some(executed_tasks) = &output.executed_tasks {
+        println!("executed_tasks {}", executed_tasks.len());
+        for executed in executed_tasks {
+            println!(
+                "  executed {} provider={} workspace={} trajectory={}",
+                executed.task_id,
+                executed.provider,
+                executed.workspace.display(),
+                executed.trajectory_path.display()
+            );
+        }
+    }
+}
+
+// Execute the planned job stage by stage and return one result record per completed task.
+fn execute_planned_job(
+    cli: &Cli,
+    config: Option<&CliConfig>,
+    planned: &daddy_orchestrator::PlannedJob,
+    prepared_workspaces: Option<&daddy_workspace::PreparedWorkspaceSet>,
+) -> Result<Vec<ExecutedTask>> {
+    let catalog = default_catalog();
+    let mcp_servers = resolve_mcp_servers(cli, config)?;
+    let mut executed_tasks = Vec::new();
+    for stage in &planned.execution.stages {
+        let stage_results = std::thread::scope(|scope| {
+            let mut handles: Vec<std::thread::ScopedJoinHandle<'_, Result<ExecutedTask>>> =
+                Vec::new();
+            for task_id in &stage.task_ids {
+                let task = planned
+                    .graph
+                    .tasks
+                    .iter()
+                    .find(|task| &task.id == task_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown planned task: {task_id}"))?;
+                let assignment = planned
+                    .execution
+                    .assignments
+                    .iter()
+                    .find(|assignment| assignment.task_id == task.id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing assignment for task {}", task.id))?;
+                let context = planned
+                    .contexts
+                    .iter()
+                    .find(|context| context.task_id == task.id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing context bundle for task {}", task.id))?;
+                let workspace =
+                    task_workspace_path(&planned.graph.job, prepared_workspaces, &task.id)?;
+                let trajectory_path = task_trajectory_path(&planned.graph.job, &task.id);
+                let catalog = catalog.clone();
+                let model = cli
+                    .model
+                    .clone()
+                    .or_else(|| config.and_then(|cfg| cfg.model.clone()));
+                let reasoning = cli
+                    .reasoning
+                    .clone()
+                    .or_else(|| config.and_then(|cfg| cfg.reasoning.clone()));
+                let system_prompt = cli
+                    .system_prompt
+                    .clone()
+                    .or_else(|| config.and_then(|cfg| cfg.system_prompt.clone()));
+                let mcp_servers = mcp_servers.clone();
+                handles.push(scope.spawn(move || -> Result<ExecutedTask> {
+                    let agent = build_task_agent(TaskAgentSpec {
+                        catalog,
+                        provider: assignment.provider.clone(),
+                        model_tier: assignment.model_tier.clone(),
+                        cwd: workspace.clone(),
+                        model,
+                        reasoning,
+                        system_prompt,
+                        mcp_servers,
+                    });
+                    let trajectory = agent.completion(
+                        &build_task_prompt(&planned.graph.job.goal, &task, &context),
+                        RunOptions {
+                            traj_path: Some(trajectory_path.clone()),
+                        },
+                    )?;
+                    Ok(ExecutedTask {
+                        task_id: task.id,
+                        provider: assignment.provider,
+                        workspace,
+                        trajectory_path,
+                        result: trajectory.result(),
+                    })
+                }));
+            }
+            let mut stage_results = Vec::new();
+            for handle in handles {
+                stage_results.push(handle.join().unwrap()?);
+            }
+            Ok::<Vec<ExecutedTask>, anyhow::Error>(stage_results)
+        })?;
+        executed_tasks.extend(stage_results);
+    }
+    Ok(executed_tasks)
+}
+
+// Build a task-scoped worker agent that targets one provider and one workspace.
+fn build_task_agent(spec: TaskAgentSpec) -> Agent {
+    Agent::builder(spec.catalog)
+        .with_options(AgentOptions {
+            provider: Some(vec![spec.provider]),
+            model: spec.model,
+            model_tier: spec.model_tier,
+            reasoning: spec.reasoning,
+            system_prompt: spec.system_prompt,
+            data_dir: None,
+            cwd: Some(spec.cwd),
+            metadata: Default::default(),
+            mcp_servers: spec.mcp_servers,
+        })
+        .build()
+}
+
+// Render a task prompt that keeps the worker focused on one scoped change set.
+fn build_task_prompt(
+    job_goal: &str,
+    task: &daddy_orchestrator::Task,
+    context: &daddy_orchestrator::ContextBundle,
+) -> String {
+    let acceptance = if context.notes.is_empty() {
+        "- Complete the task safely.".to_string()
+    } else {
+        context
+            .notes
+            .iter()
+            .map(|note| format!("- {note}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let relevant_paths = if context.relevant_paths.is_empty() {
+        "- Use repository discovery carefully and keep scope narrow.".to_string()
+    } else {
+        context
+            .relevant_paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "High-level goal:\n{job_goal}\n\nTask:\n{}\n\nTask description:\n{}\n\nRelevant paths:\n{}\n\nAcceptance criteria:\n{}\n\nRules:\n- Work only on this task.\n- Do not rewrite unrelated files.\n- Prefer the listed paths first.\n- Leave the workspace in a reviewable state.",
+        task.title, task.description, relevant_paths, acceptance
+    )
+}
+
+// Resolve the workspace path for one task, falling back to the job root when no isolated worktree was prepared.
+fn task_workspace_path(
+    job: &daddy_orchestrator::Job,
+    prepared_workspaces: Option<&daddy_workspace::PreparedWorkspaceSet>,
+    task_id: &str,
+) -> Result<PathBuf> {
+    if let Some(prepared) = prepared_workspaces {
+        let worktree = prepared
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.task_id == task_id)
+            .ok_or_else(|| anyhow!("missing prepared worktree for task {task_id}"))?;
+        Ok(worktree.path.clone())
+    } else {
+        Ok(job.cwd.clone())
+    }
+}
+
+// Compute the trajectory path used to persist one task-scoped worker run.
+fn task_trajectory_path(job: &daddy_orchestrator::Job, task_id: &str) -> PathBuf {
+    job.cwd
+        .join(".daddy")
+        .join("runs")
+        .join(&job.id)
+        .join(task_id)
+        .join("trajectory.json")
 }
 
 // Resume a session either from a saved trajectory path or a JSON resume handle.
@@ -592,6 +854,8 @@ mod tests {
                 goal: vec!["Build".to_string(), "OAuth".to_string()],
                 planner: "caveman".to_string(),
                 json: false,
+                prepare_worktrees: false,
+                execute: false,
             })),
             provider: Some("claude,codex".to_string()),
             model: None,

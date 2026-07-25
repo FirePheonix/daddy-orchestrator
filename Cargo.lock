@@ -251,6 +251,7 @@ dependencies = [
  "daddy-providers",
  "daddy-storage",
  "daddy-viewer",
+ "daddy-workspace",
  "serde",
  "serde_json",
  "tempfile",
@@ -315,6 +316,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
+]
+
+[[package]]
+name = "daddy-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "daddy-orchestrator",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

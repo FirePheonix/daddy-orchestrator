@@ -75,6 +75,32 @@ fn prefixed_path(dir: &Path) -> String {
         .to_string()
 }
 
+// Initialize a temporary Git repository so orchestration tests can create isolated worktrees.
+fn init_git_repo(dir: &Path) {
+    run_git(dir, &["init"]);
+    run_git(dir, &["config", "user.email", "daddy@example.com"]);
+    run_git(dir, &["config", "user.name", "Daddy"]);
+    std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+    run_git(dir, &["add", "README.md"]);
+    run_git(dir, &["commit", "-m", "seed"]);
+}
+
+// Run one Git command inside the test repository and fail loudly if it does not succeed.
+fn run_git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout: {}\nstderr: {}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 // Execute the compiled CLI against a mocked codex binary and verify the final answer.
 fn one_shot_completion_uses_mocked_codex_binary() {
@@ -113,4 +139,46 @@ fn doctor_reports_mocked_codex_installation() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("codex"));
     assert!(stdout.contains("installed=true"));
+}
+
+#[test]
+// Execute an orchestrated run with prepared worktrees and verify the JSON output includes task results.
+fn orchestrated_run_executes_tasks_in_prepared_worktrees() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mock_codex(dir.path());
+    init_git_repo(dir.path());
+    let output = Command::new(daddy_binary())
+        .current_dir(dir.path())
+        .env("PATH", prefixed_path(dir.path()))
+        .arg("--provider")
+        .arg("codex")
+        .arg("run")
+        .arg("--json")
+        .arg("--prepare-worktrees")
+        .arg("--execute")
+        .arg("Fix")
+        .arg("failing")
+        .arg("auth")
+        .arg("tests")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let worktrees = value
+        .get("prepared_workspaces")
+        .and_then(|prepared| prepared.get("worktrees"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    let executed = value
+        .get("executed_tasks")
+        .and_then(serde_json::Value::as_array)
+        .unwrap();
+    assert!(!worktrees.is_empty());
+    assert!(!executed.is_empty());
+    assert!(executed.iter().all(|task| task.get("result").is_some()));
 }
