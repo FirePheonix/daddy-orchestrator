@@ -1,0 +1,27 @@
+[package]
+name = "daddy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+daddy-core = { path = "../daddy-core" }
+daddy-providers = { path = "../daddy-providers" }
+daddy-storage = { path = "../daddy-storage" }
+daddy-viewer = { path = "../daddy-viewer" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "daddy"
+path = "src/main.rs"
+
+[[bin]]
+name = "daddy-traj"
+path = "src/traj_main.rs"

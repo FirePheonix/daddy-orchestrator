@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Daddy Orchestrator Viewer</title>
+  <style>
+    :root {
+      --bg: #f3efe6;
+      --panel: rgba(255,255,255,0.85);
+      --ink: #1e1a16;
+      --muted: #75685f;
+      --accent: #b6421d;
+      --line: rgba(30,26,22,0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Iowan Old Style", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(182,66,29,0.18), transparent 28%),
+        linear-gradient(180deg, #f7f2e8 0%, #efe7d8 100%);
+      min-height: 100vh;
+    }
+    main { max-width: 980px; margin: 0 auto; padding: 40px 20px 80px; }
+    h1 { font-size: clamp(2rem, 6vw, 4rem); margin: 0 0 8px; }
+    p { color: var(--muted); margin-top: 0; }
+    .panel {
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 24px 48px rgba(60, 38, 24, 0.12);
+    }
+    .row { display: flex; gap: 12px; margin-bottom: 16px; }
+    input {
+      flex: 1;
+      padding: 14px 16px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font: inherit;
+      background: rgba(255,255,255,0.9);
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 14px 20px;
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      cursor: pointer;
+    }
+    .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 20px 0; }
+    .cell { padding: 14px; border-radius: 14px; background: rgba(255,255,255,0.65); border: 1px solid var(--line); }
+    .label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+    .value { font-size: 1.1rem; margin-top: 6px; }
+    .turn { border-top: 1px solid var(--line); padding: 18px 0; }
+    .role { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 6px; }
+    pre { white-space: pre-wrap; margin: 0; font: 0.95rem/1.5 "Cascadia Code", Consolas, monospace; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Trajectory Viewer</h1>
+  <p>Load a saved `trajectory.json` file by absolute path.</p>
+  <section class="panel">
+    <div class="row">
+      <input id="path" placeholder="E:\path\to\trajectory.json">
+      <button id="load">Load</button>
+    </div>
+    <div id="app"></div>
+  </section>
+</main>
+<script>
+const app = document.getElementById('app');
+document.getElementById('load').addEventListener('click', async () => {
+  const path = document.getElementById('path').value.trim();
+  if (!path) return;
+  app.innerHTML = '<p>Loading...</p>';
+  const res = await fetch('/api/trajectory?path=' + encodeURIComponent(path));
+  const data = await res.json();
+  if (!res.ok) {
+    app.innerHTML = '<p>' + (data.error || 'Failed to load trajectory') + '</p>';
+    return;
+  }
+  render(data);
+});
+
+function esc(text) {
+  return (text || '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+}
+
+function render(traj) {
+  const turns = traj.turns || [];
+  let html = '<div class="meta">';
+  html += cell('Provider', traj.agent || '');
+  html += cell('Model', traj.model || '<default>');
+  html += cell('Session', traj.session_id || '');
+  html += cell('Turns', String(turns.length));
+  html += cell('Tokens', String((traj.usage || {}).input_tokens + (traj.usage || {}).output_tokens || 0));
+  html += cell('Cost', '$' + (((traj.usage || {}).cost_usd || 0).toFixed(4)));
+  html += '</div>';
+  turns.forEach((turn, index) => {
+    html += '<div class="turn">';
+    html += '<div class="role">Turn ' + (index + 1) + ' User</div><pre>' + esc(turn.input || '') + '</pre>';
+    html += '<div class="role" style="margin-top:12px">Assistant</div><pre>' + esc(lastText(turn.output || [])) + '</pre>';
+    html += '</div>';
+  });
+  app.innerHTML = html;
+}
+
+function cell(label, value) {
+  return '<div class="cell"><div class="label">' + esc(label) + '</div><div class="value">' + esc(value) + '</div></div>';
+}
+
+function lastText(blocks) {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    if (blocks[i].type === 'text') return blocks[i].text || '';
+  }
+  return '';
+}
+</script>
+</body>
+</html>
