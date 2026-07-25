@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use daddy_core::{
-    provider::{Provider, ProviderCatalog, ProviderRequest, ProviderResponse},
     AuthSignal, ModelTier,
+    provider::{Provider, ProviderCatalog, ProviderRequest, ProviderResponse},
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -101,7 +101,10 @@ impl Provider for CodexProvider {
     fn check_auth(&self) -> Option<AuthSignal> {
         env_or_file_auth(
             "OPENAI_API_KEY",
-            &[home_path(".codex/auth.json"), home_path(".config/codex/auth.json")],
+            &[
+                home_path(".codex/auth.json"),
+                home_path(".config/codex/auth.json"),
+            ],
         )
     }
 }
@@ -128,7 +131,10 @@ impl Provider for ClaudeProvider {
 
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let mut cmd = Command::new(self.binary_name());
-        cmd.current_dir(&request.cwd).arg("-p").arg("--output-format").arg("json");
+        cmd.current_dir(&request.cwd)
+            .arg("-p")
+            .arg("--output-format")
+            .arg("json");
         if let Some(model) = request.model.as_ref() {
             cmd.arg("--model").arg(model);
         }
@@ -147,7 +153,10 @@ impl Provider for ClaudeProvider {
     }
 
     fn check_auth(&self) -> Option<AuthSignal> {
-        env_or_file_auth("ANTHROPIC_API_KEY", &[home_path(".claude/.credentials.json")])
+        env_or_file_auth(
+            "ANTHROPIC_API_KEY",
+            &[home_path(".claude/.credentials.json")],
+        )
     }
 }
 
@@ -173,7 +182,10 @@ impl Provider for OpencodeProvider {
 
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let mut cmd = Command::new(self.binary_name());
-        cmd.current_dir(&request.cwd).arg("run").arg("--format").arg("json");
+        cmd.current_dir(&request.cwd)
+            .arg("run")
+            .arg("--format")
+            .arg("json");
         if let Some(model) = request.model.as_ref() {
             cmd.arg("--model").arg(model);
         }
@@ -197,7 +209,10 @@ impl Provider for OpencodeProvider {
     fn check_auth(&self) -> Option<AuthSignal> {
         env_or_file_auth(
             "OPENCODE_API_KEY",
-            &[home_path(".config/opencode/config.json"), home_path(".config/opencode/auth.json")],
+            &[
+                home_path(".config/opencode/config.json"),
+                home_path(".config/opencode/auth.json"),
+            ],
         )
     }
 }
@@ -205,7 +220,10 @@ impl Provider for OpencodeProvider {
 fn render_command_error(name: &str, output: &std::process::Output) -> anyhow::Error {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    anyhow!("{name} execution failed: {}", if !stderr.is_empty() { stderr } else { stdout })
+    anyhow!(
+        "{name} execution failed: {}",
+        if !stderr.is_empty() { stderr } else { stdout }
+    )
 }
 
 fn env_or_file_auth(env_var: &str, files: &[PathBuf]) -> Option<AuthSignal> {
@@ -246,8 +264,14 @@ fn extract_codex_usage(stdout: &[u8]) -> daddy_core::UsageStats {
         };
         if event == "turn.completed" || event == "response.completed" {
             if let Some(tokens) = obj.get("usage").and_then(Value::as_object) {
-                usage.input_tokens = tokens.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                usage.output_tokens = tokens.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                usage.input_tokens = tokens
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                usage.output_tokens = tokens
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
             }
             if let Some(cost) = obj.get("cost_usd").and_then(Value::as_f64) {
                 usage.cost_usd = cost;
@@ -263,7 +287,12 @@ fn extract_claude_text(stdout: &str) -> Option<String> {
         .get("result")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .or_else(|| value.get("content").and_then(Value::as_str).map(ToString::to_string))
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 fn extract_opencode_text(stdout: &str) -> Option<String> {
@@ -272,7 +301,12 @@ fn extract_opencode_text(stdout: &str) -> Option<String> {
         .get("text")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .or_else(|| value.get("content").and_then(Value::as_str).map(ToString::to_string))
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 #[cfg(test)]

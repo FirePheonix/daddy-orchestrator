@@ -1,9 +1,9 @@
 use anyhow::Result;
 use axum::{
+    Json, Router,
     extract::{Query, State},
     response::{Html, IntoResponse},
     routing::get,
-    Json, Router,
 };
 use daddy_storage::load_trajectory;
 use std::collections::BTreeMap;
@@ -34,10 +34,16 @@ async fn load(
     Query(params): Query<BTreeMap<String, String>>,
 ) -> impl IntoResponse {
     let Some(path) = params.get("path") else {
-        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing path"}))).into_response();
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing path"})),
+        )
+            .into_response();
     };
     match load_trajectory(PathBuf::from(path)) {
-        Ok(trajectory) => Json(serde_json::to_value(trajectory).unwrap_or_default()).into_response(),
+        Ok(trajectory) => {
+            Json(serde_json::to_value(trajectory).unwrap_or_default()).into_response()
+        }
         Err(error) => (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": error.to_string() })),

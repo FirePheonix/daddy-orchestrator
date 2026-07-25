@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use daddy_core::{Agent, AgentOptions, ModelTier, RunOptions};
 use daddy_providers::default_catalog;
@@ -72,7 +72,10 @@ struct ResumeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").without_time().init();
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .without_time()
+        .init();
     let cli = Cli::parse();
     let catalog = default_catalog();
 
@@ -128,7 +131,8 @@ async fn main() -> Result<()> {
             let provider = catalog
                 .get(&traj.agent)
                 .ok_or_else(|| anyhow!("unknown provider in trajectory: {}", traj.agent))?;
-            let mut session = daddy_core::Session::from_trajectory(provider, &path, cli.cwd.clone())?;
+            let mut session =
+                daddy_core::Session::from_trajectory(provider, &path, cli.cwd.clone())?;
             let prompt = args.prompt.join(" ");
             let turn = session.send(&prompt)?;
             println!("{}", turn.result());
@@ -141,7 +145,12 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("provide a prompt or a subcommand"));
             }
             let agent = build_agent(&cli)?;
-            let trajectory = agent.completion(&cli.prompt.join(" "), RunOptions { traj_path: cli.traj_path })?;
+            let trajectory = agent.completion(
+                &cli.prompt.join(" "),
+                RunOptions {
+                    traj_path: cli.traj_path,
+                },
+            )?;
             println!("{}", trajectory.result());
         }
     }
@@ -167,7 +176,7 @@ fn build_agent(cli: &Cli) -> Result<Agent> {
             provider: cli
                 .provider
                 .as_ref()
-                .map(|value| value.split(',').map(|item| item.trim().to_string()).collect()),
+                .map(|value| parse_provider_order(value)),
             model: cli.model.clone(),
             model_tier,
             reasoning: cli.reasoning.clone(),
@@ -178,4 +187,13 @@ fn build_agent(cli: &Cli) -> Result<Agent> {
             mcp_servers: Vec::new(),
         })
         .build())
+}
+
+fn parse_provider_order(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }

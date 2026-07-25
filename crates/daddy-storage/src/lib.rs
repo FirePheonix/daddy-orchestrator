@@ -41,9 +41,17 @@ impl SessionStore {
         }))
     }
 
-    pub fn append_turn(&mut self, turn: &Turn, trajectory: &Trajectory, raw_output: Option<&str>) -> Result<()> {
+    pub fn append_turn(
+        &mut self,
+        turn: &Turn,
+        trajectory: &Trajectory,
+        raw_output: Option<&str>,
+    ) -> Result<()> {
         let prefix = format!("{:03}", self.turn_counter);
-        fs::write(self.turns_dir.join(format!("{prefix}_input.txt")), &turn.input)?;
+        fs::write(
+            self.turns_dir.join(format!("{prefix}_input.txt")),
+            &turn.input,
+        )?;
         if let Some(raw_output) = raw_output {
             fs::write(
                 self.turns_dir.join(format!("{prefix}_raw_output.txt")),
@@ -108,7 +116,10 @@ impl SessionStore {
     fn append_jsonl(&self, value: &impl Serialize) -> Result<()> {
         use std::io::Write;
         let path = self.root.join("traj.jsonl");
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         writeln!(file, "{}", serde_json::to_string(value)?)?;
         Ok(())
     }
@@ -139,7 +150,11 @@ pub fn inspect_trajectory(path: impl AsRef<Path>) -> Result<String> {
     out.push(String::new());
     for (idx, turn) in trajectory.turns.iter().enumerate() {
         out.push(format!("[{}] user: {}", idx + 1, preview(&turn.input)));
-        out.push(format!("[{}] assistant: {}", idx + 1, preview(&turn.result())));
+        out.push(format!(
+            "[{}] assistant: {}",
+            idx + 1,
+            preview(&turn.result())
+        ));
     }
     Ok(out.join("\n"))
 }

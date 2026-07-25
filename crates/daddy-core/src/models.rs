@@ -126,7 +126,11 @@ pub struct Trajectory {
 }
 
 impl Trajectory {
-    pub fn new(agent: impl Into<String>, model: impl Into<String>, session_id: impl Into<String>) -> Self {
+    pub fn new(
+        agent: impl Into<String>,
+        model: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Self {
         Self {
             agent: agent.into(),
             model: model.into(),

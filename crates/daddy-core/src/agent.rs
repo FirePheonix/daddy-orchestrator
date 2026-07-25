@@ -1,7 +1,7 @@
 use crate::config::{AgentOptions, RunOptions};
 use crate::models::{ContentBlock, Trajectory, Turn};
-use crate::provider::{resolve_cwd, ProviderCatalog, ProviderRequest};
-use anyhow::{anyhow, Result};
+use crate::provider::{ProviderCatalog, ProviderRequest, resolve_cwd};
+use anyhow::{Result, anyhow};
 use serde::Serialize;
 use std::fs;
 use std::io::Write;
@@ -51,31 +51,68 @@ impl Agent {
             .options
             .provider
             .clone()
-            .unwrap_or_else(|| vec!["claude".to_string(), "codex".to_string(), "opencode".to_string()]);
+            .or_else(provider_order_from_env)
+            .unwrap_or_else(|| {
+                vec![
+                    "claude".to_string(),
+                    "codex".to_string(),
+                    "opencode".to_string(),
+                ]
+            });
         let provider = self
             .catalog
             .first_installed(&order)
             .ok_or_else(|| anyhow!("no providers registered"))?;
-        let cwd = resolve_cwd(self.options.cwd.as_deref())?;
+        let cwd_override = self
+            .options
+            .cwd
+            .clone()
+            .or_else(|| std::env::var("DADDY_CWD").ok().map(PathBuf::from));
+        let effective_model_tier = self.options.model_tier.clone().or_else(model_tier_from_env);
+        let cwd = resolve_cwd(cwd_override.as_deref())?;
         let model = self
             .options
             .model
             .clone()
-            .or_else(|| self.options.model_tier.as_ref().and_then(|tier| provider.resolve_model(tier)));
-        let mut trajectory = Trajectory::new(provider.name(), model.clone().unwrap_or_default(), Uuid::new_v4().to_string());
-        trajectory.system_prompt = self.options.system_prompt.clone().unwrap_or_default();
-        trajectory.reasoning = self.options.reasoning.clone().unwrap_or_default();
+            .or_else(|| std::env::var("DADDY_MODEL").ok())
+            .or_else(|| {
+                effective_model_tier
+                    .as_ref()
+                    .and_then(|tier| provider.resolve_model(tier))
+            });
+        let reasoning = self
+            .options
+            .reasoning
+            .clone()
+            .or_else(|| std::env::var("DADDY_REASONING").ok());
+        let system_prompt = self
+            .options
+            .system_prompt
+            .clone()
+            .or_else(|| std::env::var("DADDY_SYSTEM_PROMPT").ok());
+        let data_dir = self
+            .options
+            .data_dir
+            .clone()
+            .or_else(|| std::env::var("DADDY_DATA_DIR").ok().map(PathBuf::from));
+        let mut trajectory = Trajectory::new(
+            provider.name(),
+            model.clone().unwrap_or_default(),
+            Uuid::new_v4().to_string(),
+        );
+        trajectory.system_prompt = system_prompt.clone().unwrap_or_default();
+        trajectory.reasoning = reasoning.clone().unwrap_or_default();
         trajectory.mcp_servers = self.options.mcp_servers.clone();
         trajectory.metadata = self.options.metadata.clone();
         let session = Session {
             provider,
             cwd,
             model,
-            model_tier: self.options.model_tier.clone(),
-            reasoning: self.options.reasoning.clone(),
-            system_prompt: self.options.system_prompt.clone(),
+            model_tier: effective_model_tier,
+            reasoning,
+            system_prompt,
             mcp_servers: self.options.mcp_servers.clone(),
-            data_dir: self.options.data_dir.clone(),
+            data_dir,
             trajectory,
             traj_path: run.traj_path,
             last_raw_output: None,
@@ -88,6 +125,29 @@ impl Agent {
         let mut session = self.start_session(run)?;
         session.send(message)?;
         session.end()
+    }
+}
+
+fn provider_order_from_env() -> Option<Vec<String>> {
+    let raw = std::env::var("DADDY_PROVIDER").ok()?;
+    let values: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn model_tier_from_env() -> Option<crate::models::ModelTier> {
+    match std::env::var("DADDY_MODEL_TIER").ok()?.as_str() {
+        "strongest" => Some(crate::models::ModelTier::Strongest),
+        "fast" => Some(crate::models::ModelTier::Fast),
+        _ => None,
     }
 }
 
@@ -149,7 +209,11 @@ impl Session {
     }
 
     pub fn send(&mut self, message: &str) -> Result<Turn> {
-        let prompt = render_replay_prompt(self.system_prompt.as_deref(), &self.trajectory.turns, message);
+        let prompt = render_replay_prompt(
+            self.system_prompt.as_deref(),
+            &self.trajectory.turns,
+            message,
+        );
         let response = self.provider.execute(&ProviderRequest {
             prompt,
             model: self.model.clone(),
@@ -181,7 +245,10 @@ impl Session {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&self.trajectory)?))?;
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&self.trajectory)?),
+        )?;
         Ok(())
     }
 
@@ -191,7 +258,10 @@ impl Session {
             self.save_trajectory(path)?;
         }
         if let Some(data_dir) = &self.data_dir {
-            let path = data_dir.join("sessions").join(&self.trajectory.session_id).join("trajectory.json");
+            let path = data_dir
+                .join("sessions")
+                .join(&self.trajectory.session_id)
+                .join("trajectory.json");
             self.save_trajectory(path)?;
         }
         Ok(self.trajectory)
@@ -206,7 +276,11 @@ impl Session {
         data_dir: impl AsRef<Path>,
         session_id: &str,
     ) -> Result<Self> {
-        let path = data_dir.as_ref().join("sessions").join(session_id).join("trajectory.json");
+        let path = data_dir
+            .as_ref()
+            .join("sessions")
+            .join(session_id)
+            .join("trajectory.json");
         Self::from_trajectory(provider, path, None)
     }
 
@@ -238,7 +312,10 @@ impl Session {
         let prefix = format!("{turn_index:03}");
         fs::write(turns_dir.join(format!("{prefix}_input.txt")), &turn.input)?;
         if let Some(raw_output) = &self.last_raw_output {
-            fs::write(turns_dir.join(format!("{prefix}_raw_output.txt")), raw_output)?;
+            fs::write(
+                turns_dir.join(format!("{prefix}_raw_output.txt")),
+                raw_output,
+            )?;
         }
         self.append_jsonl(&serde_json::json!({
             "type": "user",
@@ -306,7 +383,11 @@ impl Session {
     }
 }
 
-fn render_replay_prompt(system_prompt: Option<&str>, history: &[Turn], next_message: &str) -> String {
+fn render_replay_prompt(
+    system_prompt: Option<&str>,
+    history: &[Turn],
+    next_message: &str,
+) -> String {
     let mut rendered = String::new();
     if let Some(system_prompt) = system_prompt.filter(|text| !text.trim().is_empty()) {
         rendered.push_str("System instructions:\n");
@@ -350,6 +431,7 @@ mod tests {
     use crate::models::UsageStats;
     use crate::provider::{Provider, ProviderCatalog, ProviderRequest, ProviderResponse};
     use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
 
     struct MockProvider;
 
@@ -364,7 +446,10 @@ mod tests {
 
         fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
             Ok(ProviderResponse {
-                text: format!("echo: {}", request.prompt.lines().last().unwrap_or_default()),
+                text: format!(
+                    "echo: {}",
+                    request.prompt.lines().last().unwrap_or_default()
+                ),
                 raw_output: "raw".to_string(),
                 usage: UsageStats::default(),
             })
@@ -425,5 +510,21 @@ mod tests {
         assert!(session_dir.join("traj.jsonl").exists());
         assert!(session_dir.join("trajectory.json").exists());
         assert!(session_dir.join("turns").join("000_input.txt").exists());
+    }
+
+    #[test]
+    fn provider_order_can_come_from_env() {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = guard;
+        unsafe {
+            std::env::set_var("DADDY_PROVIDER", "mock");
+        }
+        let agent = Agent::builder(Arc::new(MockCatalog)).build();
+        let session = agent.start_session(RunOptions::default()).unwrap();
+        assert_eq!(session.trajectory.agent, "mock");
+        unsafe {
+            std::env::remove_var("DADDY_PROVIDER");
+        }
     }
 }
