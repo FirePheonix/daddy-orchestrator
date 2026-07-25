@@ -1,6 +1,6 @@
 # Roadmap
 
-This file tracks the implementation phases for the Rust port of `caw`.
+This file tracks the implementation phases for this project.
 
 ## Completed
 

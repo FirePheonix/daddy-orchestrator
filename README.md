@@ -2,7 +2,7 @@
 
 `daddy-orchestrator` is a Rust wrapper around coding-agent CLIs such as `codex`, `claude`, and `opencode`.
 
-It mirrors the core purpose of `caw`: one API, one CLI surface, multiple agent backends. The Rust version focuses on:
+It provides one API and one CLI surface across multiple agent backends. The Rust version focuses on:
 
 - a unified `Agent` / `Session` API
 - provider selection and health checks
