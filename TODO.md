@@ -54,10 +54,10 @@ This file tracks the implementation phases for this project.
 - [x] Execute planned tasks stage by stage inside prepared worker worktrees.
 - [x] Add task-scoped context selection so workers receive only relevant files, snippets, diffs, and acceptance criteria.
 - [x] Add session eviction rules that stop saturated workers, persist handoff artifacts, and respawn fresh workers instead of compacting long chats.
-- [ ] Add a merge and review pipeline for combining worker outputs and escalating conflicts to a reviewer worker.
-- [ ] Add structured telemetry for task cost, latency, restarts, merge outcomes, and worker selection decisions.
-- [ ] Add SQLite-backed memory and benchmark storage for completed jobs and worker outcomes.
-- [ ] Add a configurable daddy planner backend that can use local inference, OpenAI-compatible endpoints, or `vllm`.
+- [x] Add a merge and review pipeline for combining worker outputs and escalating conflicts to a reviewer worker.
+- [x] Add structured telemetry for task cost, latency, restarts, merge outcomes, and worker selection decisions.
+- [x] Add SQLite-backed memory and benchmark storage for completed jobs and worker outcomes.
+- [x] Add a configurable daddy planner backend that can use local inference, OpenAI-compatible endpoints, or `vllm`.
 - [ ] Add adaptive routing that learns which worker/model combinations perform best for each task category.
 
 ## Next testing matrix
@@ -66,6 +66,6 @@ This file tracks the implementation phases for this project.
 - [x] Unit tests for scheduler assignment, retries, and parallelism limits.
 - [x] Unit tests for context selection and handoff artifact generation.
 - [x] Unit tests for session eviction and worker respawn thresholds.
-- [ ] Integration tests for git worktree isolation and merge behavior.
+- [x] Integration tests for git worktree isolation and merge behavior.
 - [x] Integration tests for orchestrated `daddy run` flows with mocked provider workers.
 - [ ] Benchmark fixtures that compare single-worker runs against orchestrated parallel runs.

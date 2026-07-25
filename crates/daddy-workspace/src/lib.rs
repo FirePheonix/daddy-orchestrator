@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use daddy_orchestrator::{Job, Task, WorkspaceManager};
+use daddy_orchestrator::{Job, MergeEngine, Task, WorkspaceManager};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,7 +18,20 @@ pub struct PreparedWorkspaceSet {
     pub worktrees: Vec<PreparedWorktree>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeOutcome {
+    pub integration_branch: String,
+    pub integration_path: PathBuf,
+    pub merged_branches: Vec<String>,
+    pub conflict_files: Vec<String>,
+    pub review_required: bool,
+}
+
 pub struct GitWorktreeManager {
+    base_dir_name: String,
+}
+
+pub struct GitMergeEngine {
     base_dir_name: String,
 }
 
@@ -68,6 +81,65 @@ impl Default for GitWorktreeManager {
     }
 }
 
+impl GitMergeEngine {
+    // Create a Git merge engine that writes its integration worktree under the given base directory.
+    pub fn new(base_dir_name: impl Into<String>) -> Self {
+        Self {
+            base_dir_name: base_dir_name.into(),
+        }
+    }
+
+    // Merge the prepared worker branches into one integration branch and report conflicts if they occur.
+    pub fn merge_prepared(
+        &self,
+        job: &Job,
+        prepared: &PreparedWorkspaceSet,
+    ) -> Result<MergeOutcome> {
+        let integration_branch = format!("daddy/integration/{}", sanitize_segment(&job.id));
+        let integration_path = prepared
+            .repo_root
+            .join(&self.base_dir_name)
+            .join("integration")
+            .join(sanitize_segment(&job.id));
+        add_worktree(&prepared.repo_root, &integration_branch, &integration_path)?;
+        let mut merged_branches = Vec::new();
+        let mut conflict_files = Vec::new();
+        for worktree in &prepared.worktrees {
+            let output = Command::new("git")
+                .current_dir(&integration_path)
+                .args(["merge", "--no-edit", &worktree.branch])
+                .output()
+                .with_context(|| format!("failed to merge branch {}", worktree.branch))?;
+            if output.status.success() {
+                merged_branches.push(worktree.branch.clone());
+                continue;
+            }
+            conflict_files = unmerged_files(&integration_path)?;
+            return Ok(MergeOutcome {
+                integration_branch,
+                integration_path,
+                merged_branches,
+                conflict_files,
+                review_required: true,
+            });
+        }
+        Ok(MergeOutcome {
+            integration_branch,
+            integration_path,
+            merged_branches,
+            conflict_files,
+            review_required: false,
+        })
+    }
+}
+
+impl Default for GitMergeEngine {
+    // Create a merge engine that uses the default hidden repository directory.
+    fn default() -> Self {
+        Self::new(".daddy")
+    }
+}
+
 impl WorkspaceManager for GitWorktreeManager {
     // Return the workspace manager name used in CLI output and telemetry.
     fn name(&self) -> &'static str {
@@ -77,6 +149,44 @@ impl WorkspaceManager for GitWorktreeManager {
     // Prepare isolated Git worktrees for the given job and tasks.
     fn prepare(&self, job: &Job, tasks: &[Task]) -> Result<()> {
         self.prepare_set(job, tasks).map(|_| ())
+    }
+}
+
+impl MergeEngine for GitMergeEngine {
+    // Return the merge engine name used in CLI output and telemetry.
+    fn name(&self) -> &'static str {
+        "git-merge"
+    }
+
+    // Merge currently prepared worker branches for the given job when the caller has created worktrees already.
+    fn merge(&self, job: &Job) -> Result<()> {
+        let repo_root = discover_repo_root(&job.cwd)?;
+        let worktree_root = repo_root
+            .join(&self.base_dir_name)
+            .join("worktrees")
+            .join(sanitize_segment(&job.id));
+        let worktrees = std::fs::read_dir(&worktree_root)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| PreparedWorktree {
+                task_id: entry.file_name().to_string_lossy().to_string(),
+                branch: format!(
+                    "daddy/{}/{}",
+                    sanitize_segment(&job.id),
+                    entry.file_name().to_string_lossy()
+                ),
+                path: entry.path(),
+            })
+            .collect();
+        self.merge_prepared(
+            job,
+            &PreparedWorkspaceSet {
+                repo_root,
+                worktree_root,
+                worktrees,
+            },
+        )
+        .map(|_| ())
     }
 }
 
@@ -120,6 +230,17 @@ fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// Return the list of still-unmerged files after a failed merge attempt.
+fn unmerged_files(cwd: &Path) -> Result<Vec<String>> {
+    let output = run_git(cwd, ["diff", "--name-only", "--diff-filter=U"])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
 // Convert ids into branch-safe and path-safe segments for worktree naming.
@@ -170,6 +291,47 @@ mod tests {
     // Replace unsupported characters in branch and path segments so worktree names stay portable.
     fn sanitize_segment_rewrites_unsafe_characters() {
         assert_eq!(sanitize_segment("job:1/alpha"), "job-1-alpha");
+    }
+
+    #[test]
+    // Merge two prepared branches into one integration branch and report that no review is required.
+    fn git_merge_engine_merges_clean_branches() {
+        let repo = tempfile::tempdir().unwrap();
+        init_test_repo(repo.path());
+        let manager = GitWorktreeManager::default();
+        let prepared = manager
+            .prepare_set(
+                &Job {
+                    id: "job-2".to_string(),
+                    goal: "Build auth".to_string(),
+                    cwd: repo.path().to_path_buf(),
+                },
+                &[test_task("backend-auth"), test_task("frontend-auth")],
+            )
+            .unwrap();
+        std::fs::write(prepared.worktrees[0].path.join("backend.txt"), "backend\n").unwrap();
+        run_git(&prepared.worktrees[0].path, ["add", "backend.txt"]).unwrap();
+        run_git(&prepared.worktrees[0].path, ["commit", "-m", "backend"]).unwrap();
+        std::fs::write(
+            prepared.worktrees[1].path.join("frontend.txt"),
+            "frontend\n",
+        )
+        .unwrap();
+        run_git(&prepared.worktrees[1].path, ["add", "frontend.txt"]).unwrap();
+        run_git(&prepared.worktrees[1].path, ["commit", "-m", "frontend"]).unwrap();
+        let outcome = GitMergeEngine::default()
+            .merge_prepared(
+                &Job {
+                    id: "job-2".to_string(),
+                    goal: "Build auth".to_string(),
+                    cwd: repo.path().to_path_buf(),
+                },
+                &prepared,
+            )
+            .unwrap();
+        assert!(!outcome.review_required);
+        assert_eq!(outcome.merged_branches.len(), 2);
+        assert!(outcome.integration_path.exists());
     }
 
     // Initialize a throwaway Git repository with one committed file for workspace tests.

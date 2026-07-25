@@ -12,5 +12,5 @@ pub use models::{
     SessionEvictionDecision, Task, TaskGraph, TaskKind, WorkerAssignment,
 };
 pub use orchestrator::{MemoryStore, MergeEngine, Orchestrator, WorkspaceManager};
-pub use planner::{CavemanPlanner, Planner};
+pub use planner::{CavemanPlanner, Planner, PlannerBackend};
 pub use scheduler::{BasicScheduler, Scheduler};

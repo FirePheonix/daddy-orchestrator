@@ -10,9 +10,11 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 daddy-core = { path = "../daddy-core" }
+daddy-memory = { path = "../daddy-memory" }
 daddy-orchestrator = { path = "../daddy-orchestrator" }
 daddy-providers = { path = "../daddy-providers" }
 daddy-storage = { path = "../daddy-storage" }
+daddy-telemetry = { path = "../daddy-telemetry" }
 daddy-viewer = { path = "../daddy-viewer" }
 daddy-workspace = { path = "../daddy-workspace" }
 serde.workspace = true

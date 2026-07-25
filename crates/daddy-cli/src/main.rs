@@ -1,13 +1,15 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use daddy_core::{Agent, AgentOptions, MCPServer, ModelTier, RunOptions};
+use daddy_memory::{BenchmarkSummary, JobRecord, SqliteMemoryStore, TaskRunRecord};
 use daddy_orchestrator::{
-    BasicScheduler, CavemanPlanner, DisposableSessionPolicy, JobRequest, Orchestrator,
+    BasicScheduler, DisposableSessionPolicy, JobRequest, Orchestrator, PlannerBackend,
     StaticContextRouter, build_handoff_artifact,
 };
 use daddy_providers::default_catalog;
 use daddy_storage::{inspect_trajectory, load_trajectory};
-use daddy_workspace::GitWorktreeManager;
+use daddy_telemetry::{FileTelemetryRecorder, telemetry_event};
+use daddy_workspace::{GitMergeEngine, GitWorktreeManager, MergeOutcome};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,6 +82,7 @@ enum ProviderConfigValue {
 
 #[derive(Subcommand, Clone)]
 enum CommandKind {
+    Bench(BenchArgs),
     Doctor(DoctorArgs),
     Traj(TrajArgs),
     Viewer(ViewerArgs),
@@ -92,6 +95,12 @@ enum CommandKind {
 struct DoctorArgs {
     #[arg(long)]
     live: bool,
+}
+
+#[derive(Args, Clone)]
+struct BenchArgs {
+    #[arg(long)]
+    db: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -127,6 +136,12 @@ struct RunArgs {
     planner: String,
 
     #[arg(long)]
+    planner_endpoint: Option<String>,
+
+    #[arg(long)]
+    planner_model: Option<String>,
+
+    #[arg(long)]
     json: bool,
 
     #[arg(long)]
@@ -134,6 +149,12 @@ struct RunArgs {
 
     #[arg(long)]
     execute: bool,
+
+    #[arg(long)]
+    merge: bool,
+
+    #[arg(long)]
+    review_provider: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -143,6 +164,10 @@ struct RunCommandOutput {
     prepared_workspaces: Option<daddy_workspace::PreparedWorkspaceSet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     executed_tasks: Option<Vec<ExecutedTask>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge: Option<RunMergeReport>,
+    telemetry_path: PathBuf,
+    memory_db_path: PathBuf,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -155,6 +180,15 @@ struct ExecutedTask {
     eviction: daddy_orchestrator::SessionEvictionDecision,
     handoff: daddy_orchestrator::HandoffArtifact,
     result: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RunMergeReport {
+    outcome: MergeOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_trajectory_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_result: Option<String>,
 }
 
 struct TaskAgentSpec {
@@ -179,6 +213,11 @@ async fn main() -> Result<()> {
     let catalog = default_catalog();
 
     match cli.command.clone() {
+        Some(CommandKind::Bench(args)) => {
+            print_benchmark_summary(
+                resolve_memory_store(&cli, Some(&args.db))?.benchmark_summary()?,
+            );
+        }
         Some(CommandKind::Doctor(args)) => {
             print_doctor_report(&catalog, args.live, cli.model.as_deref());
         }
@@ -224,9 +263,27 @@ async fn main() -> Result<()> {
         Some(CommandKind::Run(args)) => {
             let config = config_for_cli(&cli)?;
             let request = build_job_request(&cli, config.as_ref(), &args)?;
-            let orchestrator =
-                Orchestrator::new(CavemanPlanner, BasicScheduler, StaticContextRouter);
+            let orchestrator = Orchestrator::new(
+                resolve_planner_backend(&args)?,
+                BasicScheduler,
+                StaticContextRouter,
+            );
             let planned = orchestrator.plan_job(&request)?;
+            let telemetry = FileTelemetryRecorder::new(telemetry_path(&planned.graph.job));
+            let memory = resolve_memory_store(&cli, None)?;
+            memory.record_planned_job(&planned)?;
+            telemetry.record(&telemetry_event(
+                "job_planned",
+                Some(&planned.graph.job.id),
+                None,
+                None,
+                serde_json::json!({
+                    "planner": orchestrator.planner_name(),
+                    "scheduler": orchestrator.scheduler_name(),
+                    "router": orchestrator.router_name(),
+                    "tasks": planned.graph.tasks.len(),
+                }),
+            ))?;
             let prepared_workspaces = if args.prepare_worktrees || args.execute {
                 Some(
                     GitWorktreeManager::default()
@@ -241,14 +298,66 @@ async fn main() -> Result<()> {
                     config.as_ref(),
                     &planned,
                     prepared_workspaces.as_ref(),
+                    &telemetry,
                 )?)
             } else {
                 None
             };
+            if let Some(executed_tasks) = &executed_tasks {
+                for executed in executed_tasks {
+                    memory.record_task_run(&TaskRunRecord {
+                        job_id: planned.graph.job.id.clone(),
+                        task_id: executed.task_id.clone(),
+                        provider: executed.provider.clone(),
+                        result: executed.result.clone(),
+                        trajectory_path: executed.trajectory_path.clone(),
+                        handoff_path: executed.handoff_path.clone(),
+                        eviction: executed.eviction.clone(),
+                    })?;
+                }
+            }
+            let merge = if args.merge {
+                let prepared = prepared_workspaces
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("merge requires prepared worktrees"))?;
+                Some(merge_and_review_job(
+                    &cli,
+                    config.as_ref(),
+                    &planned,
+                    prepared,
+                    executed_tasks.as_deref().unwrap_or(&[]),
+                    args.review_provider.as_deref(),
+                    &telemetry,
+                )?)
+            } else {
+                None
+            };
+            memory.record_job(&JobRecord {
+                job_id: planned.graph.job.id.clone(),
+                goal: planned.graph.job.goal.clone(),
+                planner: orchestrator.planner_name().to_string(),
+                scheduler: orchestrator.scheduler_name().to_string(),
+                router: orchestrator.router_name().to_string(),
+                total_tasks: planned.graph.tasks.len(),
+                merge_status: merge
+                    .as_ref()
+                    .map(|merge| {
+                        if merge.outcome.review_required {
+                            "review_required"
+                        } else {
+                            "merged"
+                        }
+                    })
+                    .unwrap_or("planned")
+                    .to_string(),
+            })?;
             let output = RunCommandOutput {
                 planned,
                 prepared_workspaces,
                 executed_tasks,
+                merge,
+                telemetry_path: telemetry.path().to_path_buf(),
+                memory_db_path: memory_store_path(cli.cwd.as_ref()),
             };
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
@@ -420,6 +529,37 @@ fn build_job_request(cli: &Cli, config: Option<&CliConfig>, args: &RunArgs) -> R
     })
 }
 
+// Resolve the configured planner backend from CLI flags and environment defaults.
+fn resolve_planner_backend(args: &RunArgs) -> Result<PlannerBackend> {
+    match args.planner.as_str() {
+        "caveman" => Ok(PlannerBackend::caveman()),
+        "openai-compatible" | "vllm" => {
+            let endpoint = args
+                .planner_endpoint
+                .clone()
+                .or_else(|| std::env::var("DADDY_PLANNER_ENDPOINT").ok())
+                .ok_or_else(|| anyhow!("planner endpoint is required for {}", args.planner))?;
+            let model = args
+                .planner_model
+                .clone()
+                .or_else(|| std::env::var("DADDY_PLANNER_MODEL").ok())
+                .ok_or_else(|| anyhow!("planner model is required for {}", args.planner))?;
+            let api_key = std::env::var("DADDY_PLANNER_API_KEY").ok();
+            Ok(PlannerBackend::endpoint(
+                if args.planner == "vllm" {
+                    "vllm"
+                } else {
+                    "openai-compatible"
+                },
+                endpoint,
+                model,
+                api_key,
+            ))
+        }
+        other => Err(anyhow!("unsupported planner backend: {other}")),
+    }
+}
+
 // Resolve MCP servers from a flag-driven config file first, then inline config entries.
 fn resolve_mcp_servers(cli: &Cli, config: Option<&CliConfig>) -> Result<Vec<MCPServer>> {
     if cli.mcp_config.is_some() {
@@ -508,6 +648,8 @@ fn print_run_summary(
     println!("router {router_name}");
     println!("goal {}", output.planned.graph.job.goal);
     println!("tasks {}", output.planned.graph.tasks.len());
+    println!("telemetry {}", output.telemetry_path.display());
+    println!("memory_db {}", output.memory_db_path.display());
     if let Some(prepared) = &output.prepared_workspaces {
         println!("worktree_root {}", prepared.worktree_root.display());
         println!("prepared_worktrees {}", prepared.worktrees.len());
@@ -579,6 +721,20 @@ fn print_run_summary(
             );
         }
     }
+    if let Some(merge) = &output.merge {
+        println!(
+            "merge integration_branch={} review_required={} integration_path={}",
+            merge.outcome.integration_branch,
+            merge.outcome.review_required,
+            merge.outcome.integration_path.display()
+        );
+        if !merge.outcome.conflict_files.is_empty() {
+            println!("merge_conflicts {}", merge.outcome.conflict_files.join(","));
+        }
+        if let Some(path) = &merge.review_trajectory_path {
+            println!("review_trajectory {}", path.display());
+        }
+    }
 }
 
 // Execute the planned job stage by stage and return one result record per completed task.
@@ -587,6 +743,7 @@ fn execute_planned_job(
     config: Option<&CliConfig>,
     planned: &daddy_orchestrator::PlannedJob,
     prepared_workspaces: Option<&daddy_workspace::PreparedWorkspaceSet>,
+    telemetry: &FileTelemetryRecorder,
 ) -> Result<Vec<ExecutedTask>> {
     let catalog = default_catalog();
     let mcp_servers = resolve_mcp_servers(cli, config)?;
@@ -633,6 +790,13 @@ fn execute_planned_job(
                     .clone()
                     .or_else(|| config.and_then(|cfg| cfg.system_prompt.clone()));
                 let mcp_servers = mcp_servers.clone();
+                telemetry.record(&telemetry_event(
+                    "task_started",
+                    Some(&planned.graph.job.id),
+                    Some(&task.id),
+                    Some(&assignment.provider),
+                    serde_json::json!({"workspace": workspace.display().to_string()}),
+                ))?;
                 handles.push(scope.spawn(move || -> Result<ExecutedTask> {
                     let agent = build_task_agent(TaskAgentSpec {
                         catalog,
@@ -673,7 +837,19 @@ fn execute_planned_job(
             }
             let mut stage_results = Vec::new();
             for handle in handles {
-                stage_results.push(handle.join().unwrap()?);
+                let executed = handle.join().unwrap()?;
+                telemetry.record(&telemetry_event(
+                    "task_completed",
+                    Some(&planned.graph.job.id),
+                    Some(&executed.task_id),
+                    Some(&executed.provider),
+                    serde_json::json!({
+                        "trajectory_path": executed.trajectory_path.display().to_string(),
+                        "handoff_path": executed.handoff_path.display().to_string(),
+                        "restart_reason": executed.eviction.reason,
+                    }),
+                ))?;
+                stage_results.push(executed);
             }
             Ok::<Vec<ExecutedTask>, anyhow::Error>(stage_results)
         })?;
@@ -800,6 +976,166 @@ fn detect_changed_files(workspace: &std::path::Path) -> Result<Vec<String>> {
         .collect())
 }
 
+// Merge completed task branches, and spawn a reviewer worker when the integration branch has conflicts.
+fn merge_and_review_job(
+    cli: &Cli,
+    config: Option<&CliConfig>,
+    planned: &daddy_orchestrator::PlannedJob,
+    prepared: &daddy_workspace::PreparedWorkspaceSet,
+    executed_tasks: &[ExecutedTask],
+    review_provider: Option<&str>,
+    telemetry: &FileTelemetryRecorder,
+) -> Result<RunMergeReport> {
+    telemetry.record(&telemetry_event(
+        "merge_started",
+        Some(&planned.graph.job.id),
+        None,
+        None,
+        serde_json::json!({"branches": prepared.worktrees.len()}),
+    ))?;
+    let outcome = GitMergeEngine::default().merge_prepared(&planned.graph.job, prepared)?;
+    if !outcome.review_required {
+        telemetry.record(&telemetry_event(
+            "merge_completed",
+            Some(&planned.graph.job.id),
+            None,
+            None,
+            serde_json::json!({"status": "merged"}),
+        ))?;
+        return Ok(RunMergeReport {
+            outcome,
+            review_trajectory_path: None,
+            review_result: None,
+        });
+    }
+    let provider = review_provider
+        .map(ToString::to_string)
+        .or_else(|| {
+            cli.provider.as_ref().map(|value| {
+                parse_provider_order(value)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "codex".to_string())
+            })
+        })
+        .unwrap_or_else(|| "codex".to_string());
+    let trajectory_path = planned
+        .graph
+        .job
+        .cwd
+        .join(".daddy")
+        .join("runs")
+        .join(&planned.graph.job.id)
+        .join("review")
+        .join("trajectory.json");
+    telemetry.record(&telemetry_event(
+        "review_started",
+        Some(&planned.graph.job.id),
+        Some("review"),
+        Some(&provider),
+        serde_json::json!({"conflicts": outcome.conflict_files}),
+    ))?;
+    let agent = build_task_agent(TaskAgentSpec {
+        catalog: default_catalog(),
+        provider: provider.clone(),
+        model_tier: Some(ModelTier::Strongest),
+        cwd: outcome.integration_path.clone(),
+        model: cli
+            .model
+            .clone()
+            .or_else(|| config.and_then(|cfg| cfg.model.clone())),
+        reasoning: cli
+            .reasoning
+            .clone()
+            .or_else(|| config.and_then(|cfg| cfg.reasoning.clone())),
+        system_prompt: cli
+            .system_prompt
+            .clone()
+            .or_else(|| config.and_then(|cfg| cfg.system_prompt.clone())),
+        mcp_servers: resolve_mcp_servers(cli, config)?,
+    });
+    let review_prompt = build_review_prompt(planned, executed_tasks, &outcome.conflict_files);
+    let trajectory = agent.completion(
+        &review_prompt,
+        RunOptions {
+            traj_path: Some(trajectory_path.clone()),
+        },
+    )?;
+    telemetry.record(&telemetry_event(
+        "review_completed",
+        Some(&planned.graph.job.id),
+        Some("review"),
+        Some(&provider),
+        serde_json::json!({"trajectory_path": trajectory_path.display().to_string()}),
+    ))?;
+    Ok(RunMergeReport {
+        outcome,
+        review_trajectory_path: Some(trajectory_path),
+        review_result: Some(trajectory.result()),
+    })
+}
+
+// Build a reviewer prompt that summarizes conflicts and the relevant completed worker outputs.
+fn build_review_prompt(
+    planned: &daddy_orchestrator::PlannedJob,
+    executed_tasks: &[ExecutedTask],
+    conflict_files: &[String],
+) -> String {
+    let handoffs = executed_tasks
+        .iter()
+        .map(|task| format!("- {}: {}", task.task_id, task.result))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let conflicts = if conflict_files.is_empty() {
+        "- No explicit conflict files were reported; verify integration output.".to_string()
+    } else {
+        conflict_files
+            .iter()
+            .map(|file| format!("- {file}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "High-level goal:\n{}\n\nResolve the integration review for the worker outputs below.\n\nConflict files:\n{}\n\nWorker summaries:\n{}\n\nRules:\n- Resolve merge conflicts in the current workspace.\n- Preserve the intent of each completed task where possible.\n- Leave the integration branch in a reviewable state.",
+        planned.graph.job.goal, conflicts, handoffs
+    )
+}
+
+// Resolve the SQLite memory store path from the current working directory or repo root override.
+fn memory_store_path(cwd: Option<&PathBuf>) -> PathBuf {
+    cwd.cloned()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join(".daddy")
+        .join("memory.db")
+}
+
+// Compute the telemetry JSONL path for one orchestrated job under the hidden runtime directory.
+fn telemetry_path(job: &daddy_orchestrator::Job) -> PathBuf {
+    job.cwd
+        .join(".daddy")
+        .join("runs")
+        .join(&job.id)
+        .join("events.jsonl")
+}
+
+// Open the SQLite memory store used to persist benchmark rows for orchestrated runs.
+fn resolve_memory_store(
+    cli: &Cli,
+    explicit_db: Option<&Option<PathBuf>>,
+) -> Result<SqliteMemoryStore> {
+    let path = explicit_db
+        .and_then(|value| value.clone())
+        .unwrap_or_else(|| memory_store_path(cli.cwd.as_ref()));
+    SqliteMemoryStore::new(path)
+}
+
+// Print one benchmark summary in a compact CLI-readable format.
+fn print_benchmark_summary(summary: BenchmarkSummary) {
+    println!("jobs {}", summary.jobs);
+    println!("task_runs {}", summary.task_runs);
+    println!("merged_jobs {}", summary.merged_jobs);
+}
+
 // Resume a session either from a saved trajectory path or a JSON resume handle.
 fn resume_session_from_source(
     catalog: &std::sync::Arc<dyn daddy_core::ProviderCatalog>,
@@ -912,9 +1248,13 @@ mod tests {
             command: Some(CommandKind::Run(RunArgs {
                 goal: vec!["Build".to_string(), "OAuth".to_string()],
                 planner: "caveman".to_string(),
+                planner_endpoint: None,
+                planner_model: None,
                 json: false,
                 prepare_worktrees: false,
                 execute: false,
+                merge: false,
+                review_provider: None,
             })),
             provider: Some("claude,codex".to_string()),
             model: None,

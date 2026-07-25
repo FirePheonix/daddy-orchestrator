@@ -1,11 +1,26 @@
 use crate::models::{Job, JobRequest, Task, TaskGraph, TaskKind};
+use anyhow::{Result, anyhow};
+use serde::Deserialize;
+use std::process::Command;
 
 pub trait Planner: Send + Sync {
     fn name(&self) -> &'static str;
-    fn plan(&self, request: &JobRequest) -> anyhow::Result<TaskGraph>;
+    fn plan(&self, request: &JobRequest) -> Result<TaskGraph>;
 }
 
 pub struct CavemanPlanner;
+
+pub enum PlannerBackend {
+    Caveman(CavemanPlanner),
+    Endpoint(EndpointPlanner),
+}
+
+pub struct EndpointPlanner {
+    name: &'static str,
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+}
 
 impl Planner for CavemanPlanner {
     // Return the planner name used in CLI output and telemetry.
@@ -14,7 +29,7 @@ impl Planner for CavemanPlanner {
     }
 
     // Decompose a high-level goal into a deterministic task graph using heuristics.
-    fn plan(&self, request: &JobRequest) -> anyhow::Result<TaskGraph> {
+    fn plan(&self, request: &JobRequest) -> Result<TaskGraph> {
         let job = Job {
             id: uuid::Uuid::new_v4().to_string(),
             goal: request.goal.clone(),
@@ -25,6 +40,209 @@ impl Planner for CavemanPlanner {
         graph.validate()?;
         Ok(graph)
     }
+}
+
+impl PlannerBackend {
+    // Create the deterministic heuristic planner backend.
+    pub fn caveman() -> Self {
+        Self::Caveman(CavemanPlanner)
+    }
+
+    // Create an OpenAI-compatible planner backend using one HTTP endpoint and model id.
+    pub fn endpoint(
+        name: &'static str,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Self {
+        Self::Endpoint(EndpointPlanner {
+            name,
+            endpoint: endpoint.into(),
+            model: model.into(),
+            api_key,
+        })
+    }
+}
+
+impl Planner for PlannerBackend {
+    // Return the active planner backend name.
+    fn name(&self) -> &'static str {
+        match self {
+            PlannerBackend::Caveman(planner) => planner.name(),
+            PlannerBackend::Endpoint(planner) => planner.name(),
+        }
+    }
+
+    // Delegate planning to the configured backend implementation.
+    fn plan(&self, request: &JobRequest) -> Result<TaskGraph> {
+        match self {
+            PlannerBackend::Caveman(planner) => planner.plan(request),
+            PlannerBackend::Endpoint(planner) => planner.plan(request),
+        }
+    }
+}
+
+impl Planner for EndpointPlanner {
+    // Return the configured endpoint planner family name.
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    // Ask an OpenAI-compatible endpoint for a JSON task graph and convert it into the shared shape.
+    fn plan(&self, request: &JobRequest) -> Result<TaskGraph> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a planning model. Decompose the user goal into task objects. Return only JSON shaped like {\"tasks\":[{\"id\":\"...\",\"title\":\"...\",\"description\":\"...\",\"kind\":\"general\",\"depends_on\":[],\"acceptance_criteria\":[],\"relevant_paths\":[]}]}."
+                },
+                {
+                    "role": "user",
+                    "content": request.goal
+                }
+            ]
+        });
+        let output = run_curl_request(&self.endpoint, self.api_key.as_deref(), &body)?;
+        let spec = parse_endpoint_task_graph(&output)?;
+        build_graph_from_spec(request, spec)
+    }
+}
+
+// Run one OpenAI-compatible planning request through the system curl binary.
+fn run_curl_request(
+    endpoint: &str,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<String> {
+    let mut cmd = Command::new("curl");
+    cmd.arg("--silent")
+        .arg("--show-error")
+        .arg("-X")
+        .arg("POST")
+        .arg(endpoint)
+        .arg("-H")
+        .arg("Content-Type: application/json");
+    if let Some(api_key) = api_key {
+        cmd.arg("-H")
+            .arg(format!("Authorization: Bearer {api_key}"));
+    }
+    cmd.arg("-d").arg(body.to_string());
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "planner request failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// Convert one endpoint response into the internal task-graph specification shape.
+fn parse_endpoint_task_graph(raw: &str) -> Result<TaskGraphSpec> {
+    if let Ok(spec) = serde_json::from_str::<TaskGraphSpec>(raw) {
+        return Ok(spec);
+    }
+    let envelope: ChatCompletionEnvelope = serde_json::from_str(raw)?;
+    let content = envelope
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.clone())
+        .ok_or_else(|| anyhow!("planner response did not contain a message content field"))?;
+    if let Ok(spec) = serde_json::from_str::<TaskGraphSpec>(&content) {
+        return Ok(spec);
+    }
+    let extracted = extract_json_object(&content)
+        .ok_or_else(|| anyhow!("planner message did not contain a parseable JSON object"))?;
+    Ok(serde_json::from_str(&extracted)?)
+}
+
+// Build a validated shared task graph from the endpoint planner's task specification.
+fn build_graph_from_spec(request: &JobRequest, spec: TaskGraphSpec) -> Result<TaskGraph> {
+    let graph = TaskGraph {
+        job: Job {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal: request.goal.clone(),
+            cwd: request.cwd.clone(),
+        },
+        tasks: spec.tasks.into_iter().map(task_from_spec).collect(),
+    };
+    graph.validate()?;
+    Ok(graph)
+}
+
+// Convert one planner task specification into the shared task model.
+fn task_from_spec(spec: TaskSpec) -> Task {
+    Task {
+        id: spec.id,
+        title: spec.title,
+        description: spec.description,
+        kind: parse_task_kind(spec.kind.as_deref()),
+        depends_on: spec.depends_on,
+        acceptance_criteria: spec.acceptance_criteria,
+        relevant_paths: spec.relevant_paths,
+    }
+}
+
+// Parse the planner's task-kind string into the shared task-kind enum.
+fn parse_task_kind(value: Option<&str>) -> TaskKind {
+    match value.unwrap_or("general") {
+        "backend" => TaskKind::Backend,
+        "frontend" => TaskKind::Frontend,
+        "tests" => TaskKind::Tests,
+        "docs" => TaskKind::Docs,
+        "refactor" => TaskKind::Refactor,
+        "bugfix" => TaskKind::Bugfix,
+        "review" => TaskKind::Review,
+        "research" => TaskKind::Research,
+        _ => TaskKind::General,
+    }
+}
+
+// Extract the first top-level JSON object from a planner message that may contain prose wrappers.
+fn extract_json_object(value: &str) -> Option<String> {
+    let start = value.find('{')?;
+    let end = value.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(value[start..=end].to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskGraphSpec {
+    tasks: Vec<TaskSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskSpec {
+    id: String,
+    title: String,
+    description: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    relevant_paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionEnvelope {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    content: Option<String>,
 }
 
 // Build a deterministic task list from simple goal classification heuristics.
@@ -240,5 +458,27 @@ mod tests {
             }],
         };
         assert!(graph.validate().is_err());
+    }
+
+    #[test]
+    // Accept a bare JSON task graph from an endpoint planner response.
+    fn endpoint_parser_accepts_direct_json() {
+        let spec = parse_endpoint_task_graph(
+            r#"{"tasks":[{"id":"task-1","title":"Task","description":"Do work","kind":"backend","depends_on":[],"acceptance_criteria":[],"relevant_paths":["src"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.tasks.len(), 1);
+        assert_eq!(spec.tasks[0].id, "task-1");
+    }
+
+    #[test]
+    // Accept an OpenAI-compatible envelope whose message content contains the JSON task graph.
+    fn endpoint_parser_accepts_chat_completion_envelope() {
+        let spec = parse_endpoint_task_graph(
+            r#"{"choices":[{"message":{"content":"{\"tasks\":[{\"id\":\"task-1\",\"title\":\"Task\",\"description\":\"Do work\",\"kind\":\"frontend\",\"depends_on\":[],\"acceptance_criteria\":[],\"relevant_paths\":[\"app\"]}]}"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.tasks.len(), 1);
+        assert_eq!(spec.tasks[0].title, "Task");
     }
 }
