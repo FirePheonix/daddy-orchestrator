@@ -1,0 +1,39 @@
+{
+  "model": "claude-sonnet-5",
+  "duration_ms": 42,
+  "usage": {
+    "input_tokens": 100,
+    "output_tokens": 40,
+    "cache_read_input_tokens": 5,
+    "cache_creation_input_tokens": 0
+  },
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "Inspecting the request."
+    },
+    {
+      "type": "tool_use",
+      "id": "tool-1",
+      "name": "Read",
+      "input": {
+        "path": "src/main.rs"
+      }
+    },
+    {
+      "type": "tool_result",
+      "tool_use_id": "tool-1",
+      "content": [
+        {
+          "type": "text",
+          "text": "fn main() {}"
+        }
+      ],
+      "is_error": false
+    },
+    {
+      "type": "text",
+      "text": "Here is the summary."
+    }
+  ]
+}

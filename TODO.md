@@ -17,10 +17,10 @@ This file tracks the implementation phases for this project.
 - [x] Add persisted agent config files for MCP attachment and reusable project defaults.
 - [x] Add portable pricing tables and computed cost fallback when providers omit cost fields.
 - [x] Add provider-specific usage-limit detection and `doctor --live` probes.
+- [x] Add tool-call and thinking block fidelity that matches the current provider output formats more closely.
 
 ## Remaining parity work
 
-- [ ] Add tool-call and thinking block fidelity that matches the Python wrapper more closely.
 - [ ] Add broader cross-platform integration tests with mocked CLIs and fixture outputs.
 - [ ] Add examples that mirror the Python reference project.
 
@@ -36,7 +36,7 @@ This file tracks the implementation phases for this project.
 - [x] Unit tests for project config loading and CLI-over-config precedence.
 - [x] Unit tests for pricing table lookup and fallback estimation.
 - [x] Unit tests for provider-specific usage-limit detection.
-- [ ] Fixture tests for Claude JSON output parsing.
-- [ ] Fixture tests for opencode JSON event parsing.
+- [x] Fixture tests for Claude JSON output parsing.
+- [x] Fixture tests for opencode JSON event parsing.
 - [ ] Integration tests for CLI commands with mocked provider binaries.
 - [ ] Windows and Linux CI coverage.

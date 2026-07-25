@@ -764,6 +764,7 @@ fn parse_claude_blocks(stdout: &str) -> Vec<ContentBlock> {
                 blocks.push(block);
             }
         }
+        pair_claude_tool_results(content, &mut blocks);
         if !blocks.is_empty() {
             return blocks;
         }
@@ -776,6 +777,37 @@ fn parse_claude_blocks(stdout: &str) -> Vec<ContentBlock> {
         }
     }
     blocks
+}
+
+// Pair Claude tool_result blocks back into the matching tool-use blocks.
+fn pair_claude_tool_results(content: &[Value], blocks: &mut [ContentBlock]) {
+    let tool_positions: BTreeMap<String, usize> = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            ContentBlock::ToolUse(tool) => Some((tool.id.clone(), index)),
+            _ => None,
+        })
+        .collect();
+    for item in content {
+        if item.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let Some(tool_id) = item.get("tool_use_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(position) = tool_positions.get(tool_id).copied() else {
+            continue;
+        };
+        let Some(ContentBlock::ToolUse(tool)) = blocks.get_mut(position) else {
+            continue;
+        };
+        tool.output = normalize_claude_tool_result(item.get("content"));
+        tool.is_error = item
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
 }
 
 // Parse one Claude content block into the shared content model.
@@ -811,6 +843,21 @@ fn parse_claude_block(value: &Value) -> Option<ContentBlock> {
             is_error: false,
         })),
         _ => None,
+    }
+}
+
+// Convert a Claude tool-result payload into plain text.
+fn normalize_claude_tool_result(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.to_string(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => normalize_output_value(other),
+        None => String::new(),
     }
 }
 
@@ -1306,5 +1353,38 @@ mod tests {
             detect_opencode_usage_limit("FreeUsageLimitError: retry after 180"),
             Some(4)
         );
+    }
+
+    #[test]
+    // Parse the Claude fixture and keep the tool result attached to the matching tool block.
+    fn claude_fixture_preserves_tool_output() {
+        let input = include_str!("../tests/fixtures/claude_output.json");
+        let blocks = parse_claude_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        match &blocks[1] {
+            ContentBlock::ToolUse(tool) => {
+                assert_eq!(tool.name, "Read");
+                assert_eq!(tool.output, "fn main() {}");
+                assert!(!tool.is_error);
+            }
+            _ => panic!("expected tool block"),
+        }
+    }
+
+    #[test]
+    // Parse the opencode fixture and preserve reasoning, tool output, and final text order.
+    fn opencode_fixture_preserves_block_order() {
+        let input = include_bytes!("../tests/fixtures/opencode_output.jsonl");
+        let blocks = parse_opencode_blocks(input);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], ContentBlock::Thinking { .. }));
+        match &blocks[1] {
+            ContentBlock::ToolUse(tool) => {
+                assert_eq!(tool.name, "read");
+                assert_eq!(tool.output, "pub fn lib() {}");
+            }
+            _ => panic!("expected tool block"),
+        }
+        assert!(matches!(blocks[2], ContentBlock::Text { .. }));
     }
 }
