@@ -74,11 +74,17 @@ enum ProviderConfigValue {
 
 #[derive(Subcommand, Clone)]
 enum CommandKind {
-    Doctor,
+    Doctor(DoctorArgs),
     Traj(TrajArgs),
     Viewer(ViewerArgs),
     Chat(ChatArgs),
     Resume(ResumeArgs),
+}
+
+#[derive(Args, Clone)]
+struct DoctorArgs {
+    #[arg(long)]
+    live: bool,
 }
 
 #[derive(Args, Clone)]
@@ -117,8 +123,8 @@ async fn main() -> Result<()> {
     let catalog = default_catalog();
 
     match cli.command.clone() {
-        Some(CommandKind::Doctor) => {
-            print_doctor_report(&catalog);
+        Some(CommandKind::Doctor(args)) => {
+            print_doctor_report(&catalog, args.live, cli.model.as_deref());
         }
         Some(CommandKind::Traj(args)) => {
             println!("{}", inspect_trajectory(args.path)?);
@@ -305,9 +311,17 @@ fn resolve_mcp_servers(cli: &Cli, config: Option<&CliConfig>) -> Result<Vec<MCPS
 }
 
 // Print a human-readable health report for every registered provider.
-fn print_doctor_report(catalog: &std::sync::Arc<dyn daddy_core::ProviderCatalog>) {
+fn print_doctor_report(
+    catalog: &std::sync::Arc<dyn daddy_core::ProviderCatalog>,
+    live: bool,
+    model: Option<&str>,
+) {
     for provider in catalog.providers() {
-        let health = provider.check_health();
+        let health = if live {
+            provider.check_health_live(model)
+        } else {
+            provider.check_health()
+        };
         let auth = health
             .auth
             .as_ref()
@@ -319,13 +333,23 @@ fn print_doctor_report(catalog: &std::sync::Arc<dyn daddy_core::ProviderCatalog>
             .and_then(|signal| signal.credentials_path.clone())
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "{}\tinstalled={}\tresume={}\tbinary={}\tauth={}\tauth_path={}",
+            "{}\tinstalled={}\tresume={}\tbinary={}\tauth={}\tauth_path={}\tprobed={}\trate_limited={}\twait_minutes={}\terror={}",
             health.provider,
             health.installed,
             provider.supports_native_resume(),
             health.binary_path.unwrap_or_else(|| "-".to_string()),
             auth,
-            auth_path
+            auth_path,
+            health.probed,
+            health
+                .rate_limited
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            health
+                .wait_minutes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            health.error.unwrap_or_else(|| "-".to_string())
         );
     }
 }

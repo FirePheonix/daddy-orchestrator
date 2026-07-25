@@ -202,4 +202,12 @@ pub struct ProviderHealth {
     pub binary_path: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthSignal>,
+    #[serde(default)]
+    pub probed: bool,
+    #[serde(default)]
+    pub rate_limited: Option<bool>,
+    #[serde(default)]
+    pub wait_minutes: Option<u32>,
+    #[serde(default)]
+    pub error: Option<String>,
 }

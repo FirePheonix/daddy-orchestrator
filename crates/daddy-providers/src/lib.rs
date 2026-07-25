@@ -148,6 +148,11 @@ impl Provider for CodexProvider {
         })
     }
 
+    // Detect codex usage-limit messages from response text or stderr output.
+    fn usage_limit_wait(&self, text: &str) -> Option<u32> {
+        detect_codex_usage_limit(text)
+    }
+
     // Detect codex auth via env vars or local credential files.
     fn check_auth(&self) -> Option<AuthSignal> {
         env_or_file_auth(
@@ -256,6 +261,11 @@ impl Provider for ClaudeProvider {
         })
     }
 
+    // Detect Claude usage-limit messages from response text or stderr output.
+    fn usage_limit_wait(&self, text: &str) -> Option<u32> {
+        detect_claude_usage_limit(text)
+    }
+
     // Detect claude auth via env vars or local credential files.
     fn check_auth(&self) -> Option<AuthSignal> {
         env_or_file_auth(
@@ -353,6 +363,11 @@ impl Provider for OpencodeProvider {
         })
     }
 
+    // Detect opencode usage-limit messages from response text or stderr output.
+    fn usage_limit_wait(&self, text: &str) -> Option<u32> {
+        detect_opencode_usage_limit(text)
+    }
+
     // Detect opencode auth via env vars or local credential files.
     fn check_auth(&self) -> Option<AuthSignal> {
         env_or_file_auth(
@@ -362,6 +377,76 @@ impl Provider for OpencodeProvider {
                 home_path(".config/opencode/auth.json"),
             ],
         )
+    }
+}
+
+// Detect a codex usage-limit message and estimate a retry wait time.
+fn detect_codex_usage_limit(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    if !lower.contains("usage limit") {
+        return None;
+    }
+    extract_retry_minutes(text).or(Some(60))
+}
+
+// Detect a Claude usage-limit message and estimate a retry wait time.
+fn detect_claude_usage_limit(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    if !lower.contains("limit") && !lower.contains("out of usage") {
+        return None;
+    }
+    if !lower.contains("reset") && !lower.contains("resets") {
+        return None;
+    }
+    extract_retry_minutes(text).or(Some(60))
+}
+
+// Detect an opencode usage-limit message and estimate a retry wait time.
+fn detect_opencode_usage_limit(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    if !lower.contains("usagelimit") && !lower.contains("usage limit") {
+        return None;
+    }
+    extract_retry_seconds(text)
+        .map(|seconds| ((seconds / 60) + 1).max(1))
+        .or(Some(60))
+}
+
+// Extract the first integer minutes count from limit-related text.
+fn extract_retry_minutes(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    if let Some(index) = lower.find("retry after") {
+        let suffix = &lower[index + "retry after".len()..];
+        return leading_number(suffix);
+    }
+    if let Some(index) = lower.find("wait") {
+        let suffix = &lower[index + "wait".len()..];
+        return leading_number(suffix);
+    }
+    None
+}
+
+// Extract the first integer seconds count from limit-related text.
+fn extract_retry_seconds(text: &str) -> Option<u32> {
+    let lower = text.to_lowercase();
+    if let Some(index) = lower.find("retry after") {
+        let suffix = &lower[index + "retry after".len()..];
+        return leading_number(suffix);
+    }
+    None
+}
+
+// Parse the first unsigned integer that appears inside a string slice.
+fn leading_number(text: &str) -> Option<u32> {
+    let digits: String = text
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
     }
 }
 
@@ -1194,5 +1279,32 @@ mod tests {
         assert!(matches!(blocks[0], ContentBlock::Thinking { .. }));
         assert!(matches!(blocks[1], ContentBlock::ToolUse(_)));
         assert!(matches!(blocks[2], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    // Detect codex usage-limit text and return the default wait time when no duration is present.
+    fn codex_limit_is_detected() {
+        assert_eq!(
+            detect_codex_usage_limit("Usage limit reached, try later"),
+            Some(60)
+        );
+    }
+
+    #[test]
+    // Detect Claude usage-limit text and return the default wait time when no duration is present.
+    fn claude_limit_is_detected() {
+        assert_eq!(
+            detect_claude_usage_limit("You are out of usage and your limit resets soon"),
+            Some(60)
+        );
+    }
+
+    #[test]
+    // Detect opencode usage-limit text and parse retry seconds into minutes when present.
+    fn opencode_limit_is_detected() {
+        assert_eq!(
+            detect_opencode_usage_limit("FreeUsageLimitError: retry after 180"),
+            Some(4)
+        );
     }
 }

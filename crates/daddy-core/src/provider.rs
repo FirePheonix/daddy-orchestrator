@@ -52,6 +52,10 @@ pub trait Provider: Send + Sync {
         false
     }
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse>;
+    // Detect a provider-specific usage-limit message and return the wait time in minutes.
+    fn usage_limit_wait(&self, _text: &str) -> Option<u32> {
+        None
+    }
     // Detect auth state through cheap local signals such as env vars or files.
     fn check_auth(&self) -> Option<AuthSignal> {
         None
@@ -67,7 +71,50 @@ pub trait Provider: Send + Sync {
             installed: self.find_binary().is_some(),
             binary_path: self.find_binary().map(|path| path.display().to_string()),
             auth: self.check_auth(),
+            probed: false,
+            rate_limited: None,
+            wait_minutes: None,
+            error: None,
         }
+    }
+
+    // Probe the provider with a minimal prompt to confirm responsiveness or detect active limits.
+    fn check_health_live(&self, model: Option<&str>) -> ProviderHealth {
+        let mut health = self.check_health();
+        if !health.installed {
+            return health;
+        }
+        health.probed = true;
+        match self.live_probe(model) {
+            Ok(wait) => {
+                health.rate_limited = Some(wait.is_some());
+                health.wait_minutes = wait;
+            }
+            Err(error) => {
+                health.error = Some(error.to_string());
+            }
+        }
+        health
+    }
+
+    // Run a low-cost prompt and classify the response as healthy or rate-limited.
+    fn live_probe(&self, model: Option<&str>) -> Result<Option<u32>> {
+        let request = ProviderRequest {
+            session_id: "doctor-probe".to_string(),
+            message: "Reply with ok.".to_string(),
+            prompt: "Reply with ok.".to_string(),
+            model: model.map(ToString::to_string),
+            model_tier: None,
+            reasoning: None,
+            system_prompt: None,
+            cwd: std::env::current_dir()?,
+            mcp_servers: Vec::new(),
+            resume: None,
+        };
+        let response = self.execute(&request)?;
+        Ok(self
+            .usage_limit_wait(&response.text)
+            .or_else(|| self.usage_limit_wait(&response.raw_output)))
     }
 }
 

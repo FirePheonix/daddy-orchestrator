@@ -75,6 +75,13 @@ Launch the web viewer:
 daddy viewer --host 127.0.0.1 --port 7878
 ```
 
+Run provider diagnostics, with optional live probes:
+
+```bash
+daddy doctor
+daddy doctor --live
+```
+
 ## Environment variables
 
 - `DADDY_PROVIDER`: comma-separated provider order, for example `claude,codex,opencode`
