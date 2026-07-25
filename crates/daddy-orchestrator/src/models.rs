@@ -113,6 +113,15 @@ pub struct HandoffArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionEvictionDecision {
+    pub task_id: String,
+    pub should_restart: bool,
+    pub reason: String,
+    pub total_tokens: u64,
+    pub turns: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlannedJob {
     pub graph: TaskGraph,
     pub execution: ExecutionPlan,

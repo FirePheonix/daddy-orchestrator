@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use daddy_core::{Agent, AgentOptions, MCPServer, ModelTier, RunOptions};
 use daddy_orchestrator::{
-    BasicScheduler, CavemanPlanner, JobRequest, Orchestrator, StaticContextRouter,
+    BasicScheduler, CavemanPlanner, DisposableSessionPolicy, JobRequest, Orchestrator,
+    StaticContextRouter, build_handoff_artifact,
 };
 use daddy_providers::default_catalog;
 use daddy_storage::{inspect_trajectory, load_trajectory};
@@ -150,6 +151,9 @@ struct ExecutedTask {
     provider: String,
     workspace: PathBuf,
     trajectory_path: PathBuf,
+    handoff_path: PathBuf,
+    eviction: daddy_orchestrator::SessionEvictionDecision,
+    handoff: daddy_orchestrator::HandoffArtifact,
     result: String,
 }
 
@@ -565,11 +569,13 @@ fn print_run_summary(
         println!("executed_tasks {}", executed_tasks.len());
         for executed in executed_tasks {
             println!(
-                "  executed {} provider={} workspace={} trajectory={}",
+                "  executed {} provider={} workspace={} trajectory={} restart={} handoff={}",
                 executed.task_id,
                 executed.provider,
                 executed.workspace.display(),
-                executed.trajectory_path.display()
+                executed.trajectory_path.display(),
+                executed.eviction.reason,
+                executed.handoff_path.display()
             );
         }
     }
@@ -644,11 +650,23 @@ fn execute_planned_job(
                             traj_path: Some(trajectory_path.clone()),
                         },
                     )?;
+                    let handoff_path = handoff_path(&planned.graph.job, &task.id);
+                    let handoff = build_handoff_artifact(
+                        &task,
+                        &trajectory,
+                        detect_changed_files(&workspace)?,
+                    );
+                    let task_id = task.id.clone();
+                    save_handoff_artifact(&handoff_path, &handoff)?;
                     Ok(ExecutedTask {
-                        task_id: task.id,
+                        task_id,
                         provider: assignment.provider,
                         workspace,
                         trajectory_path,
+                        handoff_path,
+                        eviction: DisposableSessionPolicy::default()
+                            .evaluate(&task.id, &trajectory),
+                        handoff,
                         result: trajectory.result(),
                     })
                 }));
@@ -739,6 +757,47 @@ fn task_trajectory_path(job: &daddy_orchestrator::Job, task_id: &str) -> PathBuf
         .join(&job.id)
         .join(task_id)
         .join("trajectory.json")
+}
+
+// Compute the handoff artifact path used to persist one task-scoped worker summary.
+fn handoff_path(job: &daddy_orchestrator::Job, task_id: &str) -> PathBuf {
+    job.cwd
+        .join(".daddy")
+        .join("runs")
+        .join(&job.id)
+        .join(task_id)
+        .join("handoff.json")
+}
+
+// Persist one handoff artifact so later workers and review stages can reuse the task summary.
+fn save_handoff_artifact(
+    path: &std::path::Path,
+    artifact: &daddy_orchestrator::HandoffArtifact,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(artifact)?),
+    )?;
+    Ok(())
+}
+
+// Read the changed-file list from a worker workspace relative to the last committed Git state.
+fn detect_changed_files(workspace: &std::path::Path) -> Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["status", "--short"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .map(ToString::to_string)
+        .collect())
 }
 
 // Resume a session either from a saved trajectory path or a JSON resume handle.

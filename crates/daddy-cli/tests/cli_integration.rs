@@ -181,4 +181,6 @@ fn orchestrated_run_executes_tasks_in_prepared_worktrees() {
     assert!(!worktrees.is_empty());
     assert!(!executed.is_empty());
     assert!(executed.iter().all(|task| task.get("result").is_some()));
+    assert!(executed.iter().all(|task| task.get("eviction").is_some()));
+    assert!(executed.iter().all(|task| task.get("handoff").is_some()));
 }
