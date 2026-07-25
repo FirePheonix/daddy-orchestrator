@@ -251,6 +251,7 @@ dependencies = [
  "daddy-storage",
  "daddy-viewer",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

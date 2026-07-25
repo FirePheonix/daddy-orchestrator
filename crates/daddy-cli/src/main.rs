@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use daddy_core::{Agent, AgentOptions, ModelTier, RunOptions};
+use daddy_core::{Agent, AgentOptions, MCPServer, ModelTier, RunOptions};
 use daddy_providers::default_catalog;
 use daddy_storage::{inspect_trajectory, load_trajectory};
 use std::path::PathBuf;
@@ -31,6 +31,9 @@ struct Cli {
 
     #[arg(global = true, long)]
     traj_path: Option<PathBuf>,
+
+    #[arg(global = true, long)]
+    mcp_config: Option<PathBuf>,
 
     #[arg(global = true)]
     prompt: Vec<String>,
@@ -66,11 +69,12 @@ struct ChatArgs {
 
 #[derive(Args, Clone)]
 struct ResumeArgs {
-    path: PathBuf,
+    source: String,
     prompt: Vec<String>,
 }
 
 #[tokio::main]
+// Run the main `daddy` CLI entrypoint.
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
@@ -81,19 +85,7 @@ async fn main() -> Result<()> {
 
     match cli.command.clone() {
         Some(CommandKind::Doctor) => {
-            for provider in catalog.providers() {
-                let health = provider.check_health();
-                println!(
-                    "{}\tinstalled={}\tbinary={}\tauth={}",
-                    health.provider,
-                    health.installed,
-                    health.binary_path.unwrap_or_else(|| "-".to_string()),
-                    health
-                        .auth
-                        .map(|auth| auth.detail)
-                        .unwrap_or_else(|| "unknown".to_string())
-                );
-            }
+            print_doctor_report(&catalog);
         }
         Some(CommandKind::Traj(args)) => {
             println!("{}", inspect_trajectory(args.path)?);
@@ -126,13 +118,7 @@ async fn main() -> Result<()> {
             println!("saved session {}", trajectory.session_id);
         }
         Some(CommandKind::Resume(args)) => {
-            let path = args.path;
-            let traj = load_trajectory(&path)?;
-            let provider = catalog
-                .get(&traj.agent)
-                .ok_or_else(|| anyhow!("unknown provider in trajectory: {}", traj.agent))?;
-            let mut session =
-                daddy_core::Session::from_trajectory(provider, &path, cli.cwd.clone())?;
+            let mut session = resume_session_from_source(&catalog, &cli, &args)?;
             let prompt = args.prompt.join(" ");
             let turn = session.send(&prompt)?;
             println!("{}", turn.result());
@@ -158,6 +144,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// Build an Agent from CLI flags and environment-backed defaults.
 fn build_agent(cli: &Cli) -> Result<Agent> {
     let model_tier = if cli.model.is_none() {
         std::env::var("DADDY_MODEL_TIER")
@@ -184,11 +171,12 @@ fn build_agent(cli: &Cli) -> Result<Agent> {
             data_dir: cli.data_dir.clone(),
             cwd: cli.cwd.clone(),
             metadata: Default::default(),
-            mcp_servers: Vec::new(),
+            mcp_servers: load_mcp_servers(cli.mcp_config.as_ref())?,
         })
         .build())
 }
 
+// Parse a comma-separated provider order from a CLI flag value.
 fn parse_provider_order(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -196,4 +184,109 @@ fn parse_provider_order(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+// Print a human-readable health report for every registered provider.
+fn print_doctor_report(catalog: &std::sync::Arc<dyn daddy_core::ProviderCatalog>) {
+    for provider in catalog.providers() {
+        let health = provider.check_health();
+        let auth = health
+            .auth
+            .as_ref()
+            .map(|signal| signal.detail.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let auth_path = health
+            .auth
+            .as_ref()
+            .and_then(|signal| signal.credentials_path.clone())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\tinstalled={}\tresume={}\tbinary={}\tauth={}\tauth_path={}",
+            health.provider,
+            health.installed,
+            provider.supports_native_resume(),
+            health.binary_path.unwrap_or_else(|| "-".to_string()),
+            auth,
+            auth_path
+        );
+    }
+}
+
+// Load MCP server definitions from a JSON file when one is configured.
+fn load_mcp_servers(path: Option<&PathBuf>) -> Result<Vec<MCPServer>> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let raw = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    if let Ok(servers) = serde_json::from_value::<Vec<MCPServer>>(value.clone()) {
+        return Ok(servers);
+    }
+    if let Some(servers) = value.get("mcp_servers").or_else(|| value.get("servers")) {
+        return Ok(serde_json::from_value(servers.clone())?);
+    }
+    Err(anyhow!(
+        "MCP config must be either a JSON array or an object with `mcp_servers` or `servers`"
+    ))
+}
+
+// Resume a session either from a saved trajectory path or a JSON resume handle.
+fn resume_session_from_source(
+    catalog: &std::sync::Arc<dyn daddy_core::ProviderCatalog>,
+    cli: &Cli,
+    args: &ResumeArgs,
+) -> Result<daddy_core::Session> {
+    let candidate_path = PathBuf::from(&args.source);
+    if candidate_path.exists() {
+        let traj = load_trajectory(&candidate_path)?;
+        let provider = catalog
+            .get(&traj.agent)
+            .ok_or_else(|| anyhow!("unknown provider in trajectory: {}", traj.agent))?;
+        daddy_core::Session::from_trajectory(provider, &candidate_path, cli.cwd.clone())
+    } else {
+        let value: serde_json::Value = serde_json::from_str(&args.source)?;
+        let provider_name = value
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("resume handle is missing a provider field"))?;
+        let provider = catalog
+            .get(provider_name)
+            .ok_or_else(|| anyhow!("unknown provider in resume handle: {provider_name}"))?;
+        daddy_core::Session::from_resume_handle(provider, &args.source, cli.cwd.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // Accept a bare JSON array of MCP server definitions.
+    fn load_mcp_servers_accepts_array_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"[{"name":"calc","command":"node","args":["server.js"],"env":{"A":"1"},"url":""}]"#,
+        )
+        .unwrap();
+        let servers = load_mcp_servers(Some(&path)).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "calc");
+    }
+
+    #[test]
+    // Accept an object that wraps MCP server definitions under `mcp_servers`.
+    fn load_mcp_servers_accepts_object_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcp_servers":[{"name":"web","command":"","args":[],"env":{},"url":"http://localhost:9000"}]}"#,
+        )
+        .unwrap();
+        let servers = load_mcp_servers(Some(&path)).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].url, "http://localhost:9000");
+    }
 }

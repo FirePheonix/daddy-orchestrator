@@ -7,6 +7,7 @@ It mirrors the core purpose of `caw`: one API, one CLI surface, multiple agent b
 - a unified `Agent` / `Session` API
 - provider selection and health checks
 - replayable multi-turn sessions
+- native resume handles for supported providers
 - saved trajectories with JSON and JSONL artifacts
 - a local trajectory viewer
 
@@ -44,6 +45,13 @@ Interactive chat:
 
 ```bash
 daddy chat --provider claude --data-dir daddy_data
+```
+
+Resume from a saved trajectory path or a JSON resume handle:
+
+```bash
+daddy resume path/to/trajectory.json "Continue the task"
+daddy resume "{\"version\":1,...}" "Continue the task"
 ```
 
 Inspect a saved trajectory:

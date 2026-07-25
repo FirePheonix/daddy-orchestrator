@@ -37,6 +37,7 @@ pub struct UsageStats {
 }
 
 impl UsageStats {
+    // Return the combined input and output token count.
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
@@ -84,6 +85,7 @@ pub struct Turn {
 }
 
 impl Turn {
+    // Return the last assistant text block for this turn.
     pub fn result(&self) -> String {
         self.output
             .iter()
@@ -126,6 +128,7 @@ pub struct Trajectory {
 }
 
 impl Trajectory {
+    // Create a fresh trajectory record for a new wrapper session.
     pub fn new(
         agent: impl Into<String>,
         model: impl Into<String>,
@@ -148,10 +151,12 @@ impl Trajectory {
         }
     }
 
+    // Return the final assistant text across all recorded turns.
     pub fn result(&self) -> String {
         self.turns.last().map(Turn::result).unwrap_or_default()
     }
 
+    // Count the total number of tool-use blocks across every turn.
     pub fn total_tool_calls(&self) -> usize {
         self.turns
             .iter()
@@ -160,14 +165,24 @@ impl Trajectory {
             .count()
     }
 
+    // Append a turn and roll its usage and duration into trajectory totals.
     pub fn append_turn(&mut self, turn: Turn) {
         self.duration_ms += turn.duration_ms;
         self.usage += &turn.usage;
         self.turns.push(turn);
     }
 
+    // Stamp the trajectory with a completion timestamp.
     pub fn finalize(&mut self) {
         self.completed_at = Some(Utc::now());
+    }
+
+    // Read a string metadata field if it exists and is valid UTF-8 JSON text.
+    pub fn metadata_string(&self, key: &str) -> Option<String> {
+        self.metadata
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
     }
 }
 

@@ -1,13 +1,31 @@
 use crate::config::{AgentOptions, RunOptions};
 use crate::models::{ContentBlock, Trajectory, Turn};
-use crate::provider::{ProviderCatalog, ProviderRequest, resolve_cwd};
+use crate::provider::{ProviderCatalog, ProviderRequest, ResumeContext, resolve_cwd};
 use anyhow::{Result, anyhow};
 use serde::Serialize;
+use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ResumeHandleData {
+    version: u8,
+    provider: String,
+    session_id: String,
+    #[serde(default)]
+    provider_session_id: Option<String>,
+    #[serde(default)]
+    provider_resume_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+}
 
 pub struct AgentBuilder {
     catalog: Arc<dyn ProviderCatalog>,
@@ -15,6 +33,7 @@ pub struct AgentBuilder {
 }
 
 impl AgentBuilder {
+    // Create a builder around a provider catalog.
     pub fn new(catalog: Arc<dyn ProviderCatalog>) -> Self {
         Self {
             catalog,
@@ -22,11 +41,13 @@ impl AgentBuilder {
         }
     }
 
+    // Override the default agent options before building.
     pub fn with_options(mut self, options: AgentOptions) -> Self {
         self.options = options;
         self
     }
 
+    // Finalize the builder into an Agent.
     pub fn build(self) -> Agent {
         Agent {
             catalog: self.catalog,
@@ -42,10 +63,12 @@ pub struct Agent {
 }
 
 impl Agent {
+    // Start building a new Agent with the supplied provider catalog.
     pub fn builder(catalog: Arc<dyn ProviderCatalog>) -> AgentBuilder {
         AgentBuilder::new(catalog)
     }
 
+    // Start a mutable multi-turn session against the chosen provider.
     pub fn start_session(&self, run: RunOptions) -> Result<Session> {
         let order = self
             .options
@@ -121,6 +144,7 @@ impl Agent {
         Ok(session)
     }
 
+    // Execute a single prompt and return the completed trajectory.
     pub fn completion(&self, message: &str, run: RunOptions) -> Result<Trajectory> {
         let mut session = self.start_session(run)?;
         session.send(message)?;
@@ -128,6 +152,7 @@ impl Agent {
     }
 }
 
+// Read the provider fallback order from the environment.
 fn provider_order_from_env() -> Option<Vec<String>> {
     let raw = std::env::var("DADDY_PROVIDER").ok()?;
     let values: Vec<String> = raw
@@ -143,6 +168,7 @@ fn provider_order_from_env() -> Option<Vec<String>> {
     }
 }
 
+// Read the requested model tier from the environment.
 fn model_tier_from_env() -> Option<crate::models::ModelTier> {
     match std::env::var("DADDY_MODEL_TIER").ok()?.as_str() {
         "strongest" => Some(crate::models::ModelTier::Strongest),
@@ -166,6 +192,7 @@ pub struct Session {
 }
 
 impl Session {
+    // Rehydrate a saved trajectory into a writable session wrapper.
     pub fn from_trajectory(
         provider: Arc<dyn crate::provider::Provider>,
         path: impl AsRef<Path>,
@@ -200,21 +227,31 @@ impl Session {
         })
     }
 
+    // Borrow the current in-memory trajectory.
     pub fn trajectory(&self) -> &Trajectory {
         &self.trajectory
     }
 
+    // Borrow the raw CLI output from the last provider call.
     pub fn last_raw_output(&self) -> Option<&str> {
         self.last_raw_output.as_deref()
     }
 
+    // Send a new user message through the active provider session.
     pub fn send(&mut self, message: &str) -> Result<Turn> {
-        let prompt = render_replay_prompt(
-            self.system_prompt.as_deref(),
-            &self.trajectory.turns,
-            message,
-        );
+        let resume = self.build_resume_context();
+        let prompt = if resume.is_some() {
+            message.to_string()
+        } else {
+            render_replay_prompt(
+                self.system_prompt.as_deref(),
+                &self.trajectory.turns,
+                message,
+            )
+        };
         let response = self.provider.execute(&ProviderRequest {
+            session_id: self.trajectory.session_id.clone(),
+            message: message.to_string(),
             prompt,
             model: self.model.clone(),
             model_tier: self.model_tier.clone(),
@@ -222,16 +259,28 @@ impl Session {
             system_prompt: self.system_prompt.clone(),
             cwd: self.cwd.clone(),
             mcp_servers: self.mcp_servers.clone(),
+            resume,
         })?;
+        merge_metadata(&mut self.trajectory.metadata, response.metadata);
         let turn = Turn {
             input: message.to_string(),
             output: vec![ContentBlock::Text {
                 text: response.text.clone(),
             }],
             usage: response.usage.clone(),
-            duration_ms: 0,
+            duration_ms: response.duration_ms,
         };
         self.last_raw_output = Some(response.raw_output);
+        if self.trajectory.model.is_empty() {
+            if let Some(model) = self
+                .trajectory
+                .metadata
+                .get("resolved_model")
+                .and_then(Value::as_str)
+            {
+                self.trajectory.model = model.to_string();
+            }
+        }
         self.trajectory.append_turn(turn.clone());
         self.persist_turn(&turn)?;
         if let Some(path) = &self.traj_path {
@@ -240,6 +289,7 @@ impl Session {
         Ok(turn)
     }
 
+    // Write the current trajectory snapshot to a specific path.
     pub fn save_trajectory(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -252,6 +302,7 @@ impl Session {
         Ok(())
     }
 
+    // Finalize the session and flush the last trajectory snapshot to disk.
     pub fn end(mut self) -> Result<Trajectory> {
         self.trajectory.finalize();
         if let Some(path) = self.traj_path.take() {
@@ -267,10 +318,22 @@ impl Session {
         Ok(self.trajectory)
     }
 
+    // Return a self-contained handle that can reopen the backend session later.
     pub fn resume_handle(&self) -> String {
-        self.trajectory.session_id.clone()
+        serde_json::to_string(&ResumeHandleData {
+            version: 1,
+            provider: self.provider.name().to_string(),
+            session_id: self.trajectory.session_id.clone(),
+            provider_session_id: self.trajectory.metadata_string("provider_session_id"),
+            provider_resume_key: self.trajectory.metadata_string("provider_resume_key"),
+            model: self.model.clone(),
+            reasoning: self.reasoning.clone(),
+            system_prompt: self.system_prompt.clone(),
+        })
+        .unwrap_or_else(|_| self.trajectory.session_id.clone())
     }
 
+    // Reload a stored session directly from a `data_dir` session folder.
     pub fn resume_from_data_dir(
         provider: Arc<dyn crate::provider::Provider>,
         data_dir: impl AsRef<Path>,
@@ -284,6 +347,48 @@ impl Session {
         Self::from_trajectory(provider, path, None)
     }
 
+    // Rebuild a session from a self-contained resume handle payload.
+    pub fn from_resume_handle(
+        provider: Arc<dyn crate::provider::Provider>,
+        handle: &str,
+        cwd: Option<PathBuf>,
+    ) -> Result<Self> {
+        let handle = parse_resume_handle(handle)?;
+        let mut trajectory = Trajectory::new(
+            handle.provider.clone(),
+            handle.model.clone().unwrap_or_default(),
+            handle.session_id.clone(),
+        );
+        trajectory.reasoning = handle.reasoning.clone().unwrap_or_default();
+        trajectory.system_prompt = handle.system_prompt.clone().unwrap_or_default();
+        if let Some(provider_session_id) = handle.provider_session_id.clone() {
+            trajectory.metadata.insert(
+                "provider_session_id".to_string(),
+                serde_json::json!(provider_session_id),
+            );
+        }
+        if let Some(provider_resume_key) = handle.provider_resume_key.clone() {
+            trajectory.metadata.insert(
+                "provider_resume_key".to_string(),
+                serde_json::json!(provider_resume_key),
+            );
+        }
+        Ok(Self {
+            provider,
+            cwd: cwd.unwrap_or(std::env::current_dir()?),
+            model: handle.model,
+            model_tier: None,
+            reasoning: handle.reasoning,
+            system_prompt: handle.system_prompt,
+            mcp_servers: Vec::new(),
+            data_dir: None,
+            trajectory,
+            traj_path: None,
+            last_raw_output: None,
+        })
+    }
+
+    // Append the initial metadata line for on-disk session storage.
     fn write_metadata(&self) -> Result<()> {
         let Some(root) = self.session_root() else {
             return Ok(());
@@ -302,6 +407,7 @@ impl Session {
         }))
     }
 
+    // Persist one completed turn into the JSONL log and turn files.
     fn persist_turn(&self, turn: &Turn) -> Result<()> {
         let Some(root) = self.session_root() else {
             return Ok(());
@@ -363,6 +469,7 @@ impl Session {
         Ok(())
     }
 
+    // Append one JSON value as a line to the session event log.
     fn append_jsonl(&self, value: &impl Serialize) -> Result<()> {
         let Some(root) = self.session_root() else {
             return Ok(());
@@ -376,13 +483,32 @@ impl Session {
         Ok(())
     }
 
+    // Resolve the per-session storage directory under the configured data dir.
     fn session_root(&self) -> Option<PathBuf> {
         self.data_dir
             .as_ref()
             .map(|data_dir| data_dir.join("sessions").join(&self.trajectory.session_id))
     }
+
+    // Build a provider-native resume descriptor from saved trajectory metadata.
+    fn build_resume_context(&self) -> Option<ResumeContext> {
+        if !self.provider.supports_native_resume() {
+            return None;
+        }
+        let provider_session_id = self.trajectory.metadata_string("provider_session_id");
+        let provider_resume_key = self.trajectory.metadata_string("provider_resume_key");
+        if provider_session_id.is_none() && provider_resume_key.is_none() {
+            return None;
+        }
+        Some(ResumeContext {
+            session_id: self.trajectory.session_id.clone(),
+            provider_session_id,
+            provider_resume_key,
+        })
+    }
 }
 
+// Render a replayable prompt when provider-native resume is unavailable.
 fn render_replay_prompt(
     system_prompt: Option<&str>,
     history: &[Turn],
@@ -412,6 +538,22 @@ fn render_replay_prompt(
     rendered
 }
 
+// Merge provider-returned metadata into the trajectory metadata map.
+fn merge_metadata(
+    metadata: &mut std::collections::BTreeMap<String, Value>,
+    new_values: std::collections::BTreeMap<String, Value>,
+) {
+    for (key, value) in new_values {
+        metadata.insert(key, value);
+    }
+}
+
+// Parse a self-contained resume handle string into a typed payload.
+fn parse_resume_handle(handle: &str) -> Result<ResumeHandleData> {
+    Ok(serde_json::from_str(handle)?)
+}
+
+// Atomically replace a JSON file so readers never observe a partial write.
 fn atomic_write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
@@ -436,14 +578,17 @@ mod tests {
     struct MockProvider;
 
     impl Provider for MockProvider {
+        // Return the provider name used by the mock catalog.
         fn name(&self) -> &'static str {
             "mock"
         }
 
+        // Return the mock binary name for health checks.
         fn binary_name(&self) -> &'static str {
             "mock"
         }
 
+        // Execute a mocked provider request and echo the assistant suffix.
         fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
             Ok(ProviderResponse {
                 text: format!(
@@ -452,9 +597,12 @@ mod tests {
                 ),
                 raw_output: "raw".to_string(),
                 usage: UsageStats::default(),
+                duration_ms: 0,
+                metadata: BTreeMap::new(),
             })
         }
 
+        // Pretend the provider binary exists on disk.
         fn find_binary(&self) -> Option<PathBuf> {
             Some(PathBuf::from("mock"))
         }
@@ -463,6 +611,7 @@ mod tests {
     struct MockCatalog;
 
     impl ProviderCatalog for MockCatalog {
+        // Resolve the mock provider by name.
         fn get(&self, name: &str) -> Option<Arc<dyn Provider>> {
             if name == "mock" {
                 Some(Arc::new(MockProvider))
@@ -471,6 +620,7 @@ mod tests {
             }
         }
 
+        // Return the list of registered mock providers.
         fn providers(&self) -> Vec<Arc<dyn Provider>> {
             vec![Arc::new(MockProvider)]
         }
@@ -506,7 +656,10 @@ mod tests {
             .build();
         let mut session = agent.start_session(RunOptions::default()).unwrap();
         session.send("persist me").unwrap();
-        let session_dir = temp.path().join("sessions").join(session.resume_handle());
+        let session_dir = temp
+            .path()
+            .join("sessions")
+            .join(session.trajectory().session_id.clone());
         assert!(session_dir.join("traj.jsonl").exists());
         assert!(session_dir.join("trajectory.json").exists());
         assert!(session_dir.join("turns").join("000_input.txt").exists());
@@ -526,5 +679,138 @@ mod tests {
         unsafe {
             std::env::remove_var("DADDY_PROVIDER");
         }
+    }
+
+    struct ResumeAwareProvider {
+        requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    }
+
+    impl Provider for ResumeAwareProvider {
+        // Return the provider name used by the resume-aware mock.
+        fn name(&self) -> &'static str {
+            "resume-mock"
+        }
+
+        // Return the binary name used by the resume-aware mock.
+        fn binary_name(&self) -> &'static str {
+            "resume-mock"
+        }
+
+        // Declare native resume support for the resume-aware mock provider.
+        fn supports_native_resume(&self) -> bool {
+            true
+        }
+
+        // Capture requests and emit a provider resume key after the first turn.
+        fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            let mut metadata = BTreeMap::new();
+            metadata.insert(
+                "provider_session_id".to_string(),
+                serde_json::json!(request.session_id),
+            );
+            metadata.insert(
+                "provider_resume_key".to_string(),
+                serde_json::json!("thread-1"),
+            );
+            metadata.insert(
+                "resolved_model".to_string(),
+                serde_json::json!("mock-model"),
+            );
+            Ok(ProviderResponse {
+                text: request.message.clone(),
+                raw_output: String::new(),
+                usage: UsageStats::default(),
+                duration_ms: 7,
+                metadata,
+            })
+        }
+
+        // Pretend the provider binary exists on disk.
+        fn find_binary(&self) -> Option<PathBuf> {
+            Some(PathBuf::from("resume-mock"))
+        }
+    }
+
+    struct ResumeCatalog {
+        provider: Arc<ResumeAwareProvider>,
+    }
+
+    impl ProviderCatalog for ResumeCatalog {
+        // Resolve the single resume-aware mock provider by name.
+        fn get(&self, name: &str) -> Option<Arc<dyn Provider>> {
+            if name == "resume-mock" {
+                Some(self.provider.clone())
+            } else {
+                None
+            }
+        }
+
+        // Return the single registered resume-aware provider.
+        fn providers(&self) -> Vec<Arc<dyn Provider>> {
+            vec![self.provider.clone()]
+        }
+    }
+
+    #[test]
+    // Verify that provider-native resume is used after the first turn records a resume key.
+    fn session_uses_native_resume_after_first_turn() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ResumeAwareProvider {
+            requests: requests.clone(),
+        });
+        let agent = Agent::builder(Arc::new(ResumeCatalog { provider }))
+            .with_options(AgentOptions {
+                provider: Some(vec!["resume-mock".to_string()]),
+                ..Default::default()
+            })
+            .build();
+        let mut session = agent.start_session(RunOptions::default()).unwrap();
+        session.send("first turn").unwrap();
+        session.send("second turn").unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].resume.is_none());
+        assert_eq!(
+            requests[1]
+                .resume
+                .as_ref()
+                .and_then(|resume| resume.provider_resume_key.as_deref()),
+            Some("thread-1")
+        );
+        assert_eq!(requests[1].prompt, "second turn");
+    }
+
+    #[test]
+    // Verify that self-contained resume handles can be parsed and reused.
+    fn session_can_be_rebuilt_from_resume_handle() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ResumeAwareProvider {
+            requests: requests.clone(),
+        });
+        let agent = Agent::builder(Arc::new(ResumeCatalog {
+            provider: provider.clone(),
+        }))
+        .with_options(AgentOptions {
+            provider: Some(vec!["resume-mock".to_string()]),
+            ..Default::default()
+        })
+        .build();
+        let mut session = agent.start_session(RunOptions::default()).unwrap();
+        session.send("first turn").unwrap();
+        let handle = session.resume_handle();
+        let parsed = parse_resume_handle(&handle).unwrap();
+        assert_eq!(parsed.provider, "resume-mock");
+        let mut resumed = Session::from_resume_handle(provider, &handle, None).unwrap();
+        resumed.send("second turn").unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .resume
+                .as_ref()
+                .and_then(|resume| resume.provider_resume_key.as_deref()),
+            Some("thread-1")
+        );
     }
 }
