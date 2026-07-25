@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use daddy_core::{Agent, AgentOptions, MCPServer, ModelTier, RunOptions};
+use daddy_orchestrator::{BasicScheduler, CavemanPlanner, JobRequest, Orchestrator};
 use daddy_providers::default_catalog;
 use daddy_storage::{inspect_trajectory, load_trajectory};
 use serde::Deserialize;
@@ -79,6 +80,7 @@ enum CommandKind {
     Viewer(ViewerArgs),
     Chat(ChatArgs),
     Resume(ResumeArgs),
+    Run(RunArgs),
 }
 
 #[derive(Args, Clone)]
@@ -110,6 +112,17 @@ struct ChatArgs {
 struct ResumeArgs {
     source: String,
     prompt: Vec<String>,
+}
+
+#[derive(Args, Clone)]
+struct RunArgs {
+    goal: Vec<String>,
+
+    #[arg(long, default_value = "caveman")]
+    planner: String,
+
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -165,6 +178,20 @@ async fn main() -> Result<()> {
                 session.save_trajectory(save_path)?;
             }
         }
+        Some(CommandKind::Run(args)) => {
+            let request = build_job_request(&cli, config_for_cli(&cli)?.as_ref(), &args)?;
+            let orchestrator = Orchestrator::new(CavemanPlanner, BasicScheduler);
+            let planned = orchestrator.plan_job(&request)?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&planned)?);
+            } else {
+                print_run_summary(
+                    &planned,
+                    orchestrator.planner_name(),
+                    orchestrator.scheduler_name(),
+                );
+            }
+        }
         None => {
             if cli.prompt.is_empty() {
                 return Err(anyhow!("provide a prompt or a subcommand"));
@@ -181,6 +208,11 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// Load config once for `run` mode without constructing the worker agent layer.
+fn config_for_cli(cli: &Cli) -> Result<Option<CliConfig>> {
+    load_cli_config(cli.config.as_ref())
 }
 
 // Build an Agent from CLI flags and environment-backed defaults.
@@ -297,6 +329,28 @@ fn parse_model_tier(value: &str) -> Option<ModelTier> {
     }
 }
 
+// Build one high-level orchestration request from CLI flags and project config.
+fn build_job_request(cli: &Cli, config: Option<&CliConfig>, args: &RunArgs) -> Result<JobRequest> {
+    if args.goal.is_empty() {
+        return Err(anyhow!("provide a goal for `daddy run`"));
+    }
+    Ok(JobRequest {
+        goal: args.goal.join(" "),
+        cwd: cli
+            .cwd
+            .clone()
+            .or_else(|| config.and_then(|cfg| cfg.cwd.clone()))
+            .unwrap_or(std::env::current_dir()?),
+        provider_order: resolve_provider_order(cli, config).unwrap_or_else(|| {
+            vec![
+                "codex".to_string(),
+                "claude".to_string(),
+                "opencode".to_string(),
+            ]
+        }),
+    })
+}
+
 // Resolve MCP servers from a flag-driven config file first, then inline config entries.
 fn resolve_mcp_servers(cli: &Cli, config: Option<&CliConfig>) -> Result<Vec<MCPServer>> {
     if cli.mcp_config.is_some() {
@@ -370,6 +424,46 @@ fn load_mcp_servers(path: Option<&PathBuf>) -> Result<Vec<MCPServer>> {
     Err(anyhow!(
         "MCP config must be either a JSON array or an object with `mcp_servers` or `servers`"
     ))
+}
+
+// Print a compact orchestration summary for a planned job.
+fn print_run_summary(
+    planned: &daddy_orchestrator::PlannedJob,
+    planner_name: &str,
+    scheduler_name: &str,
+) {
+    println!("job {}", planned.graph.job.id);
+    println!("planner {planner_name}");
+    println!("scheduler {scheduler_name}");
+    println!("goal {}", planned.graph.job.goal);
+    println!("tasks {}", planned.graph.tasks.len());
+    for stage in &planned.execution.stages {
+        println!("stage {}", stage.index);
+        for task_id in &stage.task_ids {
+            let Some(task) = planned.graph.tasks.iter().find(|task| &task.id == task_id) else {
+                continue;
+            };
+            let assignment = planned
+                .execution
+                .assignments
+                .iter()
+                .find(|assignment| assignment.task_id == task.id);
+            let provider = assignment
+                .map(|assignment| assignment.provider.as_str())
+                .unwrap_or("auto");
+            let model_tier = assignment
+                .and_then(|assignment| assignment.model_tier.as_ref())
+                .map(|tier| match tier {
+                    ModelTier::Strongest => "strongest",
+                    ModelTier::Fast => "fast",
+                })
+                .unwrap_or("auto");
+            println!(
+                "  {} [{}] provider={} tier={}",
+                task.title, task.id, provider, model_tier
+            );
+        }
+    }
 }
 
 // Resume a session either from a saved trajectory path or a JSON resume handle.
@@ -474,6 +568,42 @@ mod tests {
         assert_eq!(
             resolve_provider_order(&cli, Some(&config)).unwrap(),
             vec!["opencode".to_string(), "codex".to_string()]
+        );
+    }
+
+    #[test]
+    // Build a high-level orchestration request from CLI provider order and prompt text.
+    fn build_job_request_uses_cli_provider_order() {
+        let cli = Cli {
+            command: Some(CommandKind::Run(RunArgs {
+                goal: vec!["Build".to_string(), "OAuth".to_string()],
+                planner: "caveman".to_string(),
+                json: false,
+            })),
+            provider: Some("claude,codex".to_string()),
+            model: None,
+            reasoning: None,
+            system_prompt: None,
+            data_dir: None,
+            cwd: None,
+            traj_path: None,
+            mcp_config: None,
+            config: None,
+            prompt: Vec::new(),
+        };
+        let request = build_job_request(
+            &cli,
+            None,
+            match cli.command.as_ref().unwrap() {
+                CommandKind::Run(args) => args,
+                _ => panic!("expected run args"),
+            },
+        )
+        .unwrap();
+        assert_eq!(request.goal, "Build OAuth");
+        assert_eq!(
+            request.provider_order,
+            vec!["claude".to_string(), "codex".to_string()]
         );
     }
 }

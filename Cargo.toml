@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/daddy-core",
+    "crates/daddy-orchestrator",
     "crates/daddy-storage",
     "crates/daddy-providers",
     "crates/daddy-viewer",

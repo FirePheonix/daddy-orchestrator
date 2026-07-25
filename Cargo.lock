@@ -247,6 +247,7 @@ dependencies = [
  "anyhow",
  "clap",
  "daddy-core",
+ "daddy-orchestrator",
  "daddy-providers",
  "daddy-storage",
  "daddy-viewer",
@@ -269,6 +270,17 @@ dependencies = [
  "tempfile",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "daddy-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "daddy-core",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
