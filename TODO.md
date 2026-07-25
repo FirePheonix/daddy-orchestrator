@@ -15,11 +15,11 @@ This file tracks the implementation phases for this project.
 - [x] Add CLI-level MCP server loading from JSON config files.
 - [x] Replace one-shot provider parsing with richer event-to-trajectory block parsing for all providers.
 - [x] Add persisted agent config files for MCP attachment and reusable project defaults.
+- [x] Add portable pricing tables and computed cost fallback when providers omit cost fields.
 
 ## Remaining parity work
 
 - [ ] Add tool-call and thinking block fidelity that matches the Python wrapper more closely.
-- [ ] Add portable pricing tables and computed cost fallback when providers omit cost fields.
 - [ ] Add provider-specific usage-limit detection and `doctor --live` probes.
 - [ ] Add broader cross-platform integration tests with mocked CLIs and fixture outputs.
 - [ ] Add examples that mirror the Python reference project.
@@ -34,6 +34,7 @@ This file tracks the implementation phases for this project.
 - [x] Unit tests for native resume metadata flow.
 - [x] Unit tests for provider block parsing across codex, claude, and opencode.
 - [x] Unit tests for project config loading and CLI-over-config precedence.
+- [x] Unit tests for pricing table lookup and fallback estimation.
 - [ ] Fixture tests for Claude JSON output parsing.
 - [ ] Fixture tests for opencode JSON event parsing.
 - [ ] Integration tests for CLI commands with mocked provider binaries.

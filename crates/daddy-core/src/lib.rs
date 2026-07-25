@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod config;
 pub mod models;
+pub mod pricing;
 pub mod provider;
 
 pub use agent::{Agent, AgentBuilder, Session};
@@ -9,4 +10,5 @@ pub use models::{
     AuthSignal, ContentBlock, MCPServer, ModelTier, ProviderHealth, ToolCall, Trajectory, Turn,
     UsageStats,
 };
+pub use pricing::compute_cost;
 pub use provider::{Provider, ProviderCatalog, ProviderRequest, ProviderResponse, ResumeContext};

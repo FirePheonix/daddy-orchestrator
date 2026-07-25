@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use daddy_core::{
-    AuthSignal, ContentBlock, MCPServer, ModelTier, ToolCall,
+    AuthSignal, ContentBlock, MCPServer, ModelTier, ToolCall, compute_cost,
     provider::{Provider, ProviderCatalog, ProviderRequest, ProviderResponse},
 };
 use serde_json::Value;
@@ -126,6 +126,14 @@ impl Provider for CodexProvider {
         if let Some(model) = request.model.clone() {
             metadata.insert("resolved_model".to_string(), serde_json::json!(model));
         }
+        let mut usage = extract_codex_usage(&output.stdout);
+        if usage.cost_usd == 0.0 {
+            if let Some(model) = request.model.as_deref() {
+                if let Some(cost) = compute_cost("codex", model, &usage) {
+                    usage.cost_usd = cost;
+                }
+            }
+        }
         Ok(ProviderResponse {
             text: if text.trim().is_empty() {
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -134,7 +142,7 @@ impl Provider for CodexProvider {
             },
             blocks: parse_codex_blocks(&output.stdout),
             raw_output: String::from_utf8_lossy(&output.stdout).to_string(),
-            usage: extract_codex_usage(&output.stdout),
+            usage,
             duration_ms: 0,
             metadata,
         })
@@ -230,11 +238,19 @@ impl Provider for ClaudeProvider {
         if let Some(model) = extract_claude_model(&stdout).or_else(|| request.model.clone()) {
             metadata.insert("resolved_model".to_string(), serde_json::json!(model));
         }
+        let mut usage = extract_claude_usage(&output.stdout);
+        if usage.cost_usd == 0.0 {
+            if let Some(model) = extract_claude_model(&stdout).or_else(|| request.model.clone()) {
+                if let Some(cost) = compute_cost("claude", &model, &usage) {
+                    usage.cost_usd = cost;
+                }
+            }
+        }
         Ok(ProviderResponse {
             text,
             blocks: parse_claude_blocks(&stdout),
             raw_output: stdout,
-            usage: extract_claude_usage(&output.stdout),
+            usage,
             duration_ms: extract_claude_duration(&output.stdout),
             metadata,
         })
@@ -319,11 +335,19 @@ impl Provider for OpencodeProvider {
         if let Some(model) = request.model.clone() {
             metadata.insert("resolved_model".to_string(), serde_json::json!(model));
         }
+        let mut usage = extract_opencode_usage(&output.stdout);
+        if usage.cost_usd == 0.0 {
+            if let Some(model) = request.model.as_deref() {
+                if let Some(cost) = compute_cost("opencode", model, &usage) {
+                    usage.cost_usd = cost;
+                }
+            }
+        }
         Ok(ProviderResponse {
             text,
             blocks: parse_opencode_blocks(&output.stdout),
             raw_output: stdout,
-            usage: extract_opencode_usage(&output.stdout),
+            usage,
             duration_ms: 0,
             metadata,
         })

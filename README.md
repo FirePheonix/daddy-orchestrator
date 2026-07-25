@@ -9,6 +9,7 @@ It provides one API and one CLI surface across multiple agent backends. The Rust
 - replayable multi-turn sessions
 - native resume handles for supported providers
 - reusable project defaults from `daddy.json`
+- pricing fallback when providers omit cost fields
 - saved trajectories with JSON and JSONL artifacts
 - a local trajectory viewer
 
