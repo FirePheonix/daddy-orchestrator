@@ -1,0 +1,21 @@
+[
+  {
+    "name": "filesystem",
+    "command": "npx",
+    "args": [
+      "@modelcontextprotocol/server-filesystem",
+      "."
+    ],
+    "env": {},
+    "url": ""
+  },
+  {
+    "name": "fetch",
+    "command": "npx",
+    "args": [
+      "@modelcontextprotocol/server-fetch"
+    ],
+    "env": {},
+    "url": ""
+  }
+]

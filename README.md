@@ -12,6 +12,7 @@ It provides one API and one CLI surface across multiple agent backends. The Rust
 - pricing fallback when providers omit cost fields
 - saved trajectories with JSON and JSONL artifacts
 - a local trajectory viewer
+- example workflows under `examples/`
 
 ## Current architecture
 
@@ -107,6 +108,8 @@ Supported fields include:
 - `cwd`
 - `mcp_servers`
 - `mcp_config`
+
+See [examples/README.md](examples/README.md) for ready-to-run config and workflow samples.
 
 ## Provider notes
 

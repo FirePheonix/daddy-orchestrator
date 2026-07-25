@@ -1,0 +1,11 @@
+{
+  "provider": [
+    "codex",
+    "claude",
+    "opencode"
+  ],
+  "model_tier": "fast",
+  "reasoning": "medium",
+  "data_dir": ".daddy-data",
+  "mcp_config": "examples/mcp-servers.json"
+}

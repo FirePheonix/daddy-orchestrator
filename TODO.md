@@ -22,7 +22,7 @@ This file tracks the implementation phases for this project.
 ## Remaining parity work
 
 - [x] Add broader cross-platform integration tests with mocked CLIs and fixture outputs.
-- [ ] Add workflow examples for common one-shot, chat, resume, and viewer flows.
+- [x] Add workflow examples for common one-shot, chat, resume, and viewer flows.
 
 ## Testing matrix
 
