@@ -268,9 +268,10 @@ async fn main() -> Result<()> {
                 BasicScheduler,
                 StaticContextRouter,
             );
-            let planned = orchestrator.plan_job(&request)?;
+            let mut planned = orchestrator.plan_job(&request)?;
             let telemetry = FileTelemetryRecorder::new(telemetry_path(&planned.graph.job));
             let memory = resolve_memory_store(&cli, None)?;
+            apply_adaptive_routing(&mut planned, &memory, &telemetry, &request.provider_order)?;
             memory.record_planned_job(&planned)?;
             telemetry.record(&telemetry_event(
                 "job_planned",
@@ -308,6 +309,13 @@ async fn main() -> Result<()> {
                     memory.record_task_run(&TaskRunRecord {
                         job_id: planned.graph.job.id.clone(),
                         task_id: executed.task_id.clone(),
+                        task_kind: planned
+                            .graph
+                            .tasks
+                            .iter()
+                            .find(|task| task.id == executed.task_id)
+                            .map(|task| task.kind.clone())
+                            .ok_or_else(|| anyhow!("missing task kind for {}", executed.task_id))?,
                         provider: executed.provider.clone(),
                         result: executed.result.clone(),
                         trajectory_path: executed.trajectory_path.clone(),
@@ -558,6 +566,49 @@ fn resolve_planner_backend(args: &RunArgs) -> Result<PlannerBackend> {
         }
         other => Err(anyhow!("unsupported planner backend: {other}")),
     }
+}
+
+// Rewrite planned provider assignments from historical winners stored in the benchmark database.
+fn apply_adaptive_routing(
+    planned: &mut daddy_orchestrator::PlannedJob,
+    memory: &SqliteMemoryStore,
+    telemetry: &FileTelemetryRecorder,
+    allowed_providers: &[String],
+) -> Result<()> {
+    for task in &planned.graph.tasks {
+        let recommendations = memory.recommended_providers(&task.kind, 3)?;
+        let Some(recommended) = recommendations.into_iter().find(|provider| {
+            allowed_providers.is_empty()
+                || allowed_providers.iter().any(|allowed| allowed == provider)
+        }) else {
+            continue;
+        };
+        let Some(assignment) = planned
+            .execution
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.task_id == task.id)
+        else {
+            continue;
+        };
+        if assignment.provider == recommended {
+            continue;
+        }
+        let previous = assignment.provider.clone();
+        assignment.provider = recommended.clone();
+        telemetry.record(&telemetry_event(
+            "route_selected",
+            Some(&planned.graph.job.id),
+            Some(&task.id),
+            Some(&recommended),
+            serde_json::json!({
+                "task_kind": format!("{:?}", task.kind).to_lowercase(),
+                "previous_provider": previous,
+                "adaptive": true,
+            }),
+        ))?;
+    }
+    Ok(())
 }
 
 // Resolve MCP servers from a flag-driven config file first, then inline config entries.
@@ -1281,5 +1332,66 @@ mod tests {
             request.provider_order,
             vec!["claude".to_string(), "codex".to_string()]
         );
+    }
+
+    #[test]
+    // Rewrite a planned assignment when benchmark history prefers a different provider for the task kind.
+    fn adaptive_routing_prefers_historical_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = SqliteMemoryStore::new(dir.path().join("memory.db")).unwrap();
+        memory
+            .record_task_run(&TaskRunRecord {
+                job_id: "job-1".to_string(),
+                task_id: "task-1".to_string(),
+                task_kind: daddy_orchestrator::TaskKind::Backend,
+                provider: "claude".to_string(),
+                result: "done".to_string(),
+                trajectory_path: dir.path().join("trajectory.json"),
+                handoff_path: dir.path().join("handoff.json"),
+                eviction: daddy_orchestrator::SessionEvictionDecision {
+                    task_id: "task-1".to_string(),
+                    should_restart: true,
+                    reason: "task_complete".to_string(),
+                    total_tokens: 10,
+                    turns: 1,
+                },
+            })
+            .unwrap();
+        let telemetry = FileTelemetryRecorder::new(dir.path().join("events.jsonl"));
+        let mut planned = daddy_orchestrator::PlannedJob {
+            graph: daddy_orchestrator::TaskGraph {
+                job: daddy_orchestrator::Job {
+                    id: "job-2".to_string(),
+                    goal: "Build auth".to_string(),
+                    cwd: dir.path().to_path_buf(),
+                },
+                tasks: vec![daddy_orchestrator::Task {
+                    id: "backend-auth".to_string(),
+                    title: "Backend".to_string(),
+                    description: "Backend".to_string(),
+                    kind: daddy_orchestrator::TaskKind::Backend,
+                    depends_on: Vec::new(),
+                    acceptance_criteria: Vec::new(),
+                    relevant_paths: Vec::new(),
+                }],
+            },
+            execution: daddy_orchestrator::ExecutionPlan {
+                assignments: vec![daddy_orchestrator::WorkerAssignment {
+                    task_id: "backend-auth".to_string(),
+                    provider: "codex".to_string(),
+                    model_tier: Some(ModelTier::Strongest),
+                }],
+                stages: Vec::new(),
+            },
+            contexts: Vec::new(),
+        };
+        apply_adaptive_routing(
+            &mut planned,
+            &memory,
+            &telemetry,
+            &["codex".to_string(), "claude".to_string()],
+        )
+        .unwrap();
+        assert_eq!(planned.execution.assignments[0].provider, "claude");
     }
 }

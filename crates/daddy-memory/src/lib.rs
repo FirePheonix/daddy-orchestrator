@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use daddy_orchestrator::{PlannedJob, SessionEvictionDecision};
+use daddy_orchestrator::{PlannedJob, SessionEvictionDecision, TaskKind};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,7 @@ pub struct JobRecord {
 pub struct TaskRunRecord {
     pub job_id: String,
     pub task_id: String,
+    pub task_kind: TaskKind,
     pub provider: String,
     pub result: String,
     pub trajectory_path: PathBuf,
@@ -71,11 +72,12 @@ impl SqliteMemoryStore {
     pub fn record_task_run(&self, record: &TaskRunRecord) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(
-            "INSERT INTO task_runs (job_id, task_id, provider, result, trajectory_path, handoff_path, restart_reason, total_tokens, turns, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO task_runs (job_id, task_id, task_kind, provider, result, trajectory_path, handoff_path, restart_reason, total_tokens, turns, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 record.job_id,
                 record.task_id,
+                task_kind_label(&record.task_kind),
                 record.provider,
                 record.result,
                 record.trajectory_path.display().to_string(),
@@ -122,6 +124,27 @@ impl SqliteMemoryStore {
         })
     }
 
+    // Return historically successful providers for one task kind ordered by recent observation volume.
+    pub fn recommended_providers(&self, task_kind: &TaskKind, limit: usize) -> Result<Vec<String>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT provider
+             FROM task_runs
+             WHERE task_kind = ?1
+             GROUP BY provider
+             ORDER BY COUNT(*) DESC, MAX(created_at) DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![task_kind_label(task_kind), limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut providers = Vec::new();
+        for row in rows {
+            providers.push(row?);
+        }
+        Ok(providers)
+    }
+
     // Open one SQLite connection to the backing database file.
     fn connection(&self) -> Result<Connection> {
         Ok(Connection::open(&self.path)?)
@@ -149,6 +172,7 @@ impl SqliteMemoryStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id TEXT NOT NULL,
                 task_id TEXT NOT NULL,
+                task_kind TEXT NOT NULL DEFAULT 'general',
                 provider TEXT NOT NULL,
                 result TEXT NOT NULL,
                 trajectory_path TEXT NOT NULL,
@@ -166,6 +190,21 @@ impl SqliteMemoryStore {
             ",
         )?;
         Ok(())
+    }
+}
+
+// Convert one task kind into the stable storage label used by adaptive routing queries.
+fn task_kind_label(task_kind: &TaskKind) -> &'static str {
+    match task_kind {
+        TaskKind::Backend => "backend",
+        TaskKind::Frontend => "frontend",
+        TaskKind::Tests => "tests",
+        TaskKind::Docs => "docs",
+        TaskKind::Refactor => "refactor",
+        TaskKind::Bugfix => "bugfix",
+        TaskKind::Review => "review",
+        TaskKind::Research => "research",
+        TaskKind::General => "general",
     }
 }
 
@@ -211,6 +250,7 @@ mod tests {
             .record_task_run(&TaskRunRecord {
                 job_id: "job-1".to_string(),
                 task_id: "task-1".to_string(),
+                task_kind: TaskKind::Backend,
                 provider: "codex".to_string(),
                 result: "done".to_string(),
                 trajectory_path: dir.path().join("trajectory.json"),
@@ -228,5 +268,9 @@ mod tests {
         assert_eq!(summary.jobs, 1);
         assert_eq!(summary.task_runs, 1);
         assert_eq!(summary.merged_jobs, 1);
+        assert_eq!(
+            store.recommended_providers(&TaskKind::Backend, 3).unwrap(),
+            vec!["codex".to_string()]
+        );
     }
 }

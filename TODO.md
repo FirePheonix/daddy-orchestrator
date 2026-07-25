@@ -58,7 +58,7 @@ This file tracks the implementation phases for this project.
 - [x] Add structured telemetry for task cost, latency, restarts, merge outcomes, and worker selection decisions.
 - [x] Add SQLite-backed memory and benchmark storage for completed jobs and worker outcomes.
 - [x] Add a configurable daddy planner backend that can use local inference, OpenAI-compatible endpoints, or `vllm`.
-- [ ] Add adaptive routing that learns which worker/model combinations perform best for each task category.
+- [x] Add adaptive routing that learns which worker/model combinations perform best for each task category.
 
 ## Next testing matrix
 
