@@ -2,6 +2,9 @@ use crate::config::{AgentOptions, RunOptions};
 use crate::models::{ContentBlock, Trajectory, Turn};
 use crate::provider::{resolve_cwd, ProviderCatalog, ProviderRequest};
 use anyhow::{anyhow, Result};
+use serde::Serialize;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -64,7 +67,7 @@ impl Agent {
         trajectory.reasoning = self.options.reasoning.clone().unwrap_or_default();
         trajectory.mcp_servers = self.options.mcp_servers.clone();
         trajectory.metadata = self.options.metadata.clone();
-        Ok(Session {
+        let session = Session {
             provider,
             cwd,
             model,
@@ -76,7 +79,9 @@ impl Agent {
             trajectory,
             traj_path: run.traj_path,
             last_raw_output: None,
-        })
+        };
+        session.write_metadata()?;
+        Ok(session)
     }
 
     pub fn completion(&self, message: &str, run: RunOptions) -> Result<Trajectory> {
@@ -164,6 +169,7 @@ impl Session {
         };
         self.last_raw_output = Some(response.raw_output);
         self.trajectory.append_turn(turn.clone());
+        self.persist_turn(&turn)?;
         if let Some(path) = &self.traj_path {
             self.save_trajectory(path)?;
         }
@@ -185,9 +191,7 @@ impl Session {
             self.save_trajectory(path)?;
         }
         if let Some(data_dir) = &self.data_dir {
-            let session_dir = data_dir.join("sessions").join(&self.trajectory.session_id);
-            std::fs::create_dir_all(&session_dir)?;
-            let path = session_dir.join("trajectory.json");
+            let path = data_dir.join("sessions").join(&self.trajectory.session_id).join("trajectory.json");
             self.save_trajectory(path)?;
         }
         Ok(self.trajectory)
@@ -195,6 +199,110 @@ impl Session {
 
     pub fn resume_handle(&self) -> String {
         self.trajectory.session_id.clone()
+    }
+
+    pub fn resume_from_data_dir(
+        provider: Arc<dyn crate::provider::Provider>,
+        data_dir: impl AsRef<Path>,
+        session_id: &str,
+    ) -> Result<Self> {
+        let path = data_dir.as_ref().join("sessions").join(session_id).join("trajectory.json");
+        Self::from_trajectory(provider, path, None)
+    }
+
+    fn write_metadata(&self) -> Result<()> {
+        let Some(root) = self.session_root() else {
+            return Ok(());
+        };
+        fs::create_dir_all(root.join("turns"))?;
+        self.append_jsonl(&serde_json::json!({
+            "type": "metadata",
+            "session_id": self.trajectory.session_id,
+            "created_at": self.trajectory.created_at,
+            "agent": self.trajectory.agent,
+            "model": self.trajectory.model,
+            "system_prompt": self.trajectory.system_prompt,
+            "reasoning": self.trajectory.reasoning,
+            "mcp_servers": self.trajectory.mcp_servers,
+            "metadata": self.trajectory.metadata,
+        }))
+    }
+
+    fn persist_turn(&self, turn: &Turn) -> Result<()> {
+        let Some(root) = self.session_root() else {
+            return Ok(());
+        };
+        let turn_index = self.trajectory.turns.len().saturating_sub(1);
+        let turns_dir = root.join("turns");
+        fs::create_dir_all(&turns_dir)?;
+        let prefix = format!("{turn_index:03}");
+        fs::write(turns_dir.join(format!("{prefix}_input.txt")), &turn.input)?;
+        if let Some(raw_output) = &self.last_raw_output {
+            fs::write(turns_dir.join(format!("{prefix}_raw_output.txt")), raw_output)?;
+        }
+        self.append_jsonl(&serde_json::json!({
+            "type": "user",
+            "turn_index": turn_index,
+            "message": turn.input,
+        }))?;
+        for block in &turn.output {
+            match block {
+                ContentBlock::Text { text } => self.append_jsonl(&serde_json::json!({
+                    "type": "text",
+                    "turn_index": turn_index,
+                    "text": text,
+                }))?,
+                ContentBlock::Thinking { text } => self.append_jsonl(&serde_json::json!({
+                    "type": "thinking",
+                    "turn_index": turn_index,
+                    "text": text,
+                }))?,
+                ContentBlock::ToolUse(tool) => {
+                    self.append_jsonl(&serde_json::json!({
+                        "type": "tool_call",
+                        "turn_index": turn_index,
+                        "id": tool.id,
+                        "name": tool.name,
+                        "arguments": tool.arguments,
+                    }))?;
+                    self.append_jsonl(&serde_json::json!({
+                        "type": "tool_result",
+                        "turn_index": turn_index,
+                        "id": tool.id,
+                        "name": tool.name,
+                        "output": tool.output,
+                        "is_error": tool.is_error,
+                    }))?;
+                }
+            }
+        }
+        self.append_jsonl(&serde_json::json!({
+            "type": "turn_end",
+            "turn_index": turn_index,
+            "usage": turn.usage,
+            "duration_ms": turn.duration_ms,
+        }))?;
+        atomic_write_json(root.join("trajectory.json"), &self.trajectory)?;
+        Ok(())
+    }
+
+    fn append_jsonl(&self, value: &impl Serialize) -> Result<()> {
+        let Some(root) = self.session_root() else {
+            return Ok(());
+        };
+        fs::create_dir_all(&root)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("traj.jsonl"))?;
+        writeln!(file, "{}", serde_json::to_string(value)?)?;
+        Ok(())
+    }
+
+    fn session_root(&self) -> Option<PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|data_dir| data_dir.join("sessions").join(&self.trajectory.session_id))
     }
 }
 
@@ -221,6 +329,19 @@ fn render_replay_prompt(system_prompt: Option<&str>, history: &[Turn], next_mess
     rendered.push_str(next_message.trim());
     rendered.push_str("\n\nAssistant:");
     rendered
+}
+
+fn atomic_write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer_pretty(tmp.as_file_mut(), value)?;
+    writeln!(tmp.as_file_mut())?;
+    tmp.persist(path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -286,5 +407,23 @@ mod tests {
         session.send("two").unwrap();
         assert_eq!(session.trajectory.turns.len(), 2);
         assert!(session.trajectory.result().contains("Assistant:"));
+    }
+
+    #[test]
+    fn session_persists_turn_files_when_data_dir_is_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = Agent::builder(Arc::new(MockCatalog))
+            .with_options(AgentOptions {
+                provider: Some(vec!["mock".to_string()]),
+                data_dir: Some(temp.path().to_path_buf()),
+                ..Default::default()
+            })
+            .build();
+        let mut session = agent.start_session(RunOptions::default()).unwrap();
+        session.send("persist me").unwrap();
+        let session_dir = temp.path().join("sessions").join(session.resume_handle());
+        assert!(session_dir.join("traj.jsonl").exists());
+        assert!(session_dir.join("trajectory.json").exists());
+        assert!(session_dir.join("turns").join("000_input.txt").exists());
     }
 }
