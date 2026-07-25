@@ -40,3 +40,31 @@ This file tracks the implementation phases for this project.
 - [x] Fixture tests for opencode JSON event parsing.
 - [x] Integration tests for CLI commands with mocked provider binaries.
 - [x] Windows and Linux CI coverage.
+
+## Next orchestration track
+
+- [x] Add `docs/ORCHESTRATOR_ARCHITECTURE.md` that defines the worker runtime, orchestrator core, and intelligence layer.
+- [ ] Add a new `daddy-orchestrator` crate for job orchestration above provider execution.
+- [ ] Define shared orchestrator types for `Job`, `Task`, `TaskGraph`, `WorkerAssignment`, and `HandoffArtifact`.
+- [ ] Define orchestrator traits for `Planner`, `Scheduler`, `ContextRouter`, `WorkspaceManager`, `MergeEngine`, and `MemoryStore`.
+- [ ] Implement a `CavemanPlanner` that decomposes requests with deterministic heuristics before model-backed planning exists.
+- [ ] Implement a `GitWorktreeManager` that gives every worker an isolated worktree and branch.
+- [ ] Implement a `BasicScheduler` that can assign tasks to providers and cap parallelism.
+- [ ] Add a `daddy run "<goal>"` command that executes an orchestrated job instead of a single worker session.
+- [ ] Add task-scoped context selection so workers receive only relevant files, snippets, diffs, and acceptance criteria.
+- [ ] Add session eviction rules that stop saturated workers, persist handoff artifacts, and respawn fresh workers instead of compacting long chats.
+- [ ] Add a merge and review pipeline for combining worker outputs and escalating conflicts to a reviewer worker.
+- [ ] Add structured telemetry for task cost, latency, restarts, merge outcomes, and worker selection decisions.
+- [ ] Add SQLite-backed memory and benchmark storage for completed jobs and worker outcomes.
+- [ ] Add a configurable daddy planner backend that can use local inference, OpenAI-compatible endpoints, or `vllm`.
+- [ ] Add adaptive routing that learns which worker/model combinations perform best for each task category.
+
+## Next testing matrix
+
+- [ ] Unit tests for heuristic task decomposition and task graph validation.
+- [ ] Unit tests for scheduler assignment, retries, and parallelism limits.
+- [ ] Unit tests for context selection and handoff artifact generation.
+- [ ] Unit tests for session eviction and worker respawn thresholds.
+- [ ] Integration tests for git worktree isolation and merge behavior.
+- [ ] Integration tests for orchestrated `daddy run` flows with mocked provider workers.
+- [ ] Benchmark fixtures that compare single-worker runs against orchestrated parallel runs.
