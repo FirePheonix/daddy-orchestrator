@@ -21,8 +21,8 @@ This file tracks the implementation phases for this project.
 
 ## Remaining parity work
 
-- [ ] Add broader cross-platform integration tests with mocked CLIs and fixture outputs.
-- [ ] Add examples that mirror the Python reference project.
+- [x] Add broader cross-platform integration tests with mocked CLIs and fixture outputs.
+- [ ] Add workflow examples for common one-shot, chat, resume, and viewer flows.
 
 ## Testing matrix
 
@@ -38,5 +38,5 @@ This file tracks the implementation phases for this project.
 - [x] Unit tests for provider-specific usage-limit detection.
 - [x] Fixture tests for Claude JSON output parsing.
 - [x] Fixture tests for opencode JSON event parsing.
-- [ ] Integration tests for CLI commands with mocked provider binaries.
-- [ ] Windows and Linux CI coverage.
+- [x] Integration tests for CLI commands with mocked provider binaries.
+- [x] Windows and Linux CI coverage.

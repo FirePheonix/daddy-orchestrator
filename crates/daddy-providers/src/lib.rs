@@ -86,8 +86,8 @@ impl Provider for CodexProvider {
 
     // Execute a codex request and capture usage plus resume metadata.
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let temp = tempfile::NamedTempFile::new()?;
-        let mut cmd = Command::new(self.binary_name());
+        let temp = temporary_output_path()?;
+        let mut cmd = provider_command(self);
         cmd.current_dir(&request.cwd).arg("exec");
         if let Some(resume_key) = request
             .resume
@@ -99,7 +99,7 @@ impl Provider for CodexProvider {
         cmd.arg("--json")
             .arg("--skip-git-repo-check")
             .arg("--output-last-message")
-            .arg(temp.path());
+            .arg(temp.as_ref() as &std::path::Path);
         if let Some(model) = request.model.as_ref() {
             cmd.arg("--model").arg(model);
         }
@@ -115,7 +115,8 @@ impl Provider for CodexProvider {
         if !output.status.success() {
             return Err(render_command_error("codex", &output));
         }
-        let text = fs::read_to_string(temp.path()).unwrap_or_else(|_| String::new());
+        let text =
+            fs::read_to_string(temp.as_ref() as &std::path::Path).unwrap_or_else(|_| String::new());
         let mut metadata = BTreeMap::new();
         if let Some(thread_id) = extract_codex_thread_id(&output.stdout) {
             metadata.insert(
@@ -196,7 +197,7 @@ impl Provider for ClaudeProvider {
 
     // Execute a claude request and preserve its reusable session id.
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let mut cmd = Command::new(self.binary_name());
+        let mut cmd = provider_command(self);
         let mcp_config = build_claude_mcp_config(&request.mcp_servers)?;
         cmd.current_dir(&request.cwd)
             .arg("-p")
@@ -307,7 +308,7 @@ impl Provider for OpencodeProvider {
     // Execute an opencode request and capture the emitted session id.
     fn execute(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let config = build_opencode_config(&request.mcp_servers)?;
-        let mut cmd = Command::new(self.binary_name());
+        let mut cmd = provider_command(self);
         cmd.current_dir(&request.cwd)
             .arg("run")
             .arg("--format")
@@ -378,6 +379,32 @@ impl Provider for OpencodeProvider {
             ],
         )
     }
+}
+
+// Build a process command from the resolved provider binary path when available.
+fn provider_command(provider: &dyn Provider) -> Command {
+    if let Some(path) = provider.find_binary() {
+        if cfg!(windows)
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+                .unwrap_or(false)
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").arg(path);
+            cmd
+        } else {
+            Command::new(path)
+        }
+    } else {
+        Command::new(provider.binary_name())
+    }
+}
+
+// Create a temporary output path that external CLIs can write without an open file handle.
+fn temporary_output_path() -> Result<tempfile::TempPath> {
+    Ok(tempfile::NamedTempFile::new()?.into_temp_path())
 }
 
 // Detect a codex usage-limit message and estimate a retry wait time.
