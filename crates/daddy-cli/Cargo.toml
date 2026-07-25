@@ -13,6 +13,7 @@ daddy-core = { path = "../daddy-core" }
 daddy-providers = { path = "../daddy-providers" }
 daddy-storage = { path = "../daddy-storage" }
 daddy-viewer = { path = "../daddy-viewer" }
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

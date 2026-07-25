@@ -8,6 +8,7 @@ It provides one API and one CLI surface across multiple agent backends. The Rust
 - provider selection and health checks
 - replayable multi-turn sessions
 - native resume handles for supported providers
+- reusable project defaults from `daddy.json`
 - saved trajectories with JSON and JSONL artifacts
 - a local trajectory viewer
 
@@ -47,6 +48,12 @@ Interactive chat:
 daddy chat --provider claude --data-dir daddy_data
 ```
 
+Load reusable defaults from a project config file:
+
+```bash
+daddy --config daddy.json chat
+```
+
 Resume from a saved trajectory path or a JSON resume handle:
 
 ```bash
@@ -76,6 +83,22 @@ daddy viewer --host 127.0.0.1 --port 7878
 - `DADDY_SYSTEM_PROMPT`: default system prompt
 - `DADDY_DATA_DIR`: default session data directory
 - `DADDY_CWD`: override working directory for provider execution
+
+## Project config
+
+If a `daddy.json` file exists in the working directory, the CLI loads it automatically. You can also point to another file with `--config`.
+
+Supported fields include:
+
+- `provider`
+- `model`
+- `model_tier`
+- `reasoning`
+- `system_prompt`
+- `data_dir`
+- `cwd`
+- `mcp_servers`
+- `mcp_config`
 
 ## Provider notes
 

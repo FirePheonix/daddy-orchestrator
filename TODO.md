@@ -14,11 +14,11 @@ This file tracks the implementation phases for this project.
 - [x] Add self-contained JSON resume handles in addition to path-based resume.
 - [x] Add CLI-level MCP server loading from JSON config files.
 - [x] Replace one-shot provider parsing with richer event-to-trajectory block parsing for all providers.
+- [x] Add persisted agent config files for MCP attachment and reusable project defaults.
 
 ## Remaining parity work
 
 - [ ] Add tool-call and thinking block fidelity that matches the Python wrapper more closely.
-- [ ] Add persisted agent config files for MCP attachment and reusable project defaults.
 - [ ] Add portable pricing tables and computed cost fallback when providers omit cost fields.
 - [ ] Add provider-specific usage-limit detection and `doctor --live` probes.
 - [ ] Add broader cross-platform integration tests with mocked CLIs and fixture outputs.
@@ -33,6 +33,7 @@ This file tracks the implementation phases for this project.
 - [x] Unit tests for env-driven provider order.
 - [x] Unit tests for native resume metadata flow.
 - [x] Unit tests for provider block parsing across codex, claude, and opencode.
+- [x] Unit tests for project config loading and CLI-over-config precedence.
 - [ ] Fixture tests for Claude JSON output parsing.
 - [ ] Fixture tests for opencode JSON event parsing.
 - [ ] Integration tests for CLI commands with mocked provider binaries.

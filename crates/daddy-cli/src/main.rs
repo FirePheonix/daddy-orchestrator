@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use daddy_core::{Agent, AgentOptions, MCPServer, ModelTier, RunOptions};
 use daddy_providers::default_catalog;
 use daddy_storage::{inspect_trajectory, load_trajectory};
+use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -35,8 +36,40 @@ struct Cli {
     #[arg(global = true, long)]
     mcp_config: Option<PathBuf>,
 
+    #[arg(global = true, long)]
+    config: Option<PathBuf>,
+
     #[arg(global = true)]
     prompt: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CliConfig {
+    #[serde(default)]
+    provider: Option<ProviderConfigValue>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    model_tier: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    mcp_servers: Vec<MCPServer>,
+    #[serde(default)]
+    mcp_config: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ProviderConfigValue {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 #[derive(Subcommand, Clone)]
@@ -146,32 +179,36 @@ async fn main() -> Result<()> {
 
 // Build an Agent from CLI flags and environment-backed defaults.
 fn build_agent(cli: &Cli) -> Result<Agent> {
-    let model_tier = if cli.model.is_none() {
-        std::env::var("DADDY_MODEL_TIER")
-            .ok()
-            .and_then(|tier| match tier.as_str() {
-                "strongest" => Some(ModelTier::Strongest),
-                "fast" => Some(ModelTier::Fast),
-                _ => None,
-            })
-    } else {
-        None
-    };
+    let config = load_cli_config(cli.config.as_ref())?;
+    let model_tier = resolve_model_tier(cli.model.as_ref(), config.as_ref());
+    let mcp_servers = resolve_mcp_servers(cli, config.as_ref())?;
 
     Ok(Agent::builder(default_catalog())
         .with_options(AgentOptions {
-            provider: cli
-                .provider
-                .as_ref()
-                .map(|value| parse_provider_order(value)),
-            model: cli.model.clone(),
+            provider: resolve_provider_order(cli, config.as_ref()),
+            model: cli
+                .model
+                .clone()
+                .or_else(|| config.as_ref().and_then(|cfg| cfg.model.clone())),
             model_tier,
-            reasoning: cli.reasoning.clone(),
-            system_prompt: cli.system_prompt.clone(),
-            data_dir: cli.data_dir.clone(),
-            cwd: cli.cwd.clone(),
+            reasoning: cli
+                .reasoning
+                .clone()
+                .or_else(|| config.as_ref().and_then(|cfg| cfg.reasoning.clone())),
+            system_prompt: cli
+                .system_prompt
+                .clone()
+                .or_else(|| config.as_ref().and_then(|cfg| cfg.system_prompt.clone())),
+            data_dir: cli
+                .data_dir
+                .clone()
+                .or_else(|| config.as_ref().and_then(|cfg| cfg.data_dir.clone())),
+            cwd: cli
+                .cwd
+                .clone()
+                .or_else(|| config.as_ref().and_then(|cfg| cfg.cwd.clone())),
             metadata: Default::default(),
-            mcp_servers: load_mcp_servers(cli.mcp_config.as_ref())?,
+            mcp_servers,
         })
         .build())
 }
@@ -184,6 +221,87 @@ fn parse_provider_order(value: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+// Load a CLI config file explicitly or from the default project path.
+fn load_cli_config(path: Option<&PathBuf>) -> Result<Option<CliConfig>> {
+    let Some(path) = resolve_config_path(path) else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(path)?;
+    Ok(Some(serde_json::from_str(&raw)?))
+}
+
+// Resolve the project config path from a flag or the default local filename.
+fn resolve_config_path(path: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = path {
+        return Some(path.clone());
+    }
+    let default = PathBuf::from("daddy.json");
+    if default.exists() {
+        Some(default)
+    } else {
+        None
+    }
+}
+
+// Resolve the provider fallback order from flags first, then config.
+fn resolve_provider_order(cli: &Cli, config: Option<&CliConfig>) -> Option<Vec<String>> {
+    cli.provider
+        .as_ref()
+        .map(|value| parse_provider_order(value))
+        .or_else(|| config.and_then(|cfg| cfg.provider.as_ref().map(parse_provider_config_value)))
+}
+
+// Convert a config provider field into the ordered provider list used by the agent.
+fn parse_provider_config_value(value: &ProviderConfigValue) -> Vec<String> {
+    match value {
+        ProviderConfigValue::Single(value) => parse_provider_order(value),
+        ProviderConfigValue::Multiple(values) => values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+    }
+}
+
+// Resolve the model tier from flags, then config, then the environment fallback.
+fn resolve_model_tier(model: Option<&String>, config: Option<&CliConfig>) -> Option<ModelTier> {
+    if model.is_some() {
+        return None;
+    }
+    config
+        .and_then(|cfg| cfg.model_tier.as_deref())
+        .and_then(parse_model_tier)
+        .or_else(|| {
+            std::env::var("DADDY_MODEL_TIER")
+                .ok()
+                .as_deref()
+                .and_then(parse_model_tier)
+        })
+}
+
+// Parse a model tier string into the shared tier enum.
+fn parse_model_tier(value: &str) -> Option<ModelTier> {
+    match value {
+        "strongest" => Some(ModelTier::Strongest),
+        "fast" => Some(ModelTier::Fast),
+        _ => None,
+    }
+}
+
+// Resolve MCP servers from a flag-driven config file first, then inline config entries.
+fn resolve_mcp_servers(cli: &Cli, config: Option<&CliConfig>) -> Result<Vec<MCPServer>> {
+    if cli.mcp_config.is_some() {
+        return load_mcp_servers(cli.mcp_config.as_ref());
+    }
+    if let Some(path) = config.and_then(|cfg| cfg.mcp_config.as_ref()) {
+        return load_mcp_servers(Some(path));
+    }
+    Ok(config
+        .map(|cfg| cfg.mcp_servers.clone())
+        .unwrap_or_default())
 }
 
 // Print a human-readable health report for every registered provider.
@@ -288,5 +406,50 @@ mod tests {
         let servers = load_mcp_servers(Some(&path)).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].url, "http://localhost:9000");
+    }
+
+    #[test]
+    // Load a project config from an explicit path and preserve its defaults.
+    fn load_cli_config_reads_explicit_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daddy.json");
+        std::fs::write(
+            &path,
+            r#"{"provider":["codex","claude"],"model":"gpt-test","mcp_servers":[{"name":"calc","command":"node","args":[],"env":{},"url":""}]}"#,
+        )
+        .unwrap();
+        let config = load_cli_config(Some(&path)).unwrap().unwrap();
+        assert_eq!(config.model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            parse_provider_config_value(config.provider.as_ref().unwrap()),
+            vec!["codex".to_string(), "claude".to_string()]
+        );
+        assert_eq!(config.mcp_servers.len(), 1);
+    }
+
+    #[test]
+    // Let an explicit CLI provider override the provider order from config.
+    fn resolve_provider_order_prefers_cli_over_config() {
+        let cli = Cli {
+            command: None,
+            provider: Some("opencode,codex".to_string()),
+            model: None,
+            reasoning: None,
+            system_prompt: None,
+            data_dir: None,
+            cwd: None,
+            traj_path: None,
+            mcp_config: None,
+            config: None,
+            prompt: Vec::new(),
+        };
+        let config = CliConfig {
+            provider: Some(ProviderConfigValue::Single("claude".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_provider_order(&cli, Some(&config)).unwrap(),
+            vec!["opencode".to_string(), "codex".to_string()]
+        );
     }
 }

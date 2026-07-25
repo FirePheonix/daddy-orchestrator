@@ -250,6 +250,7 @@ dependencies = [
  "daddy-providers",
  "daddy-storage",
  "daddy-viewer",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
